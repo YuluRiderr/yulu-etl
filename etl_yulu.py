@@ -6,10 +6,6 @@ Run daily via GitHub Actions at 1 AM IST.
 
 import io
 import os
-import re
-import json
-import urllib.parse
-from datetime import date, timedelta
 
 import pandas as pd
 import requests
@@ -46,45 +42,40 @@ def get_gspread_client() -> gspread.Client:
 
 # ─────────────────────────────────────────────────────────────
 # METABASE FETCH
+# Uses /api/card/{id}/query/csv  — runs the saved card directly.
+# Avoids 403 issues with raw /api/dataset/csv SQL payloads.
 # ─────────────────────────────────────────────────────────────
-def fetch_metabase_csv(card_id: int) -> pd.DataFrame:
-    yesterday = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
-    date_sql  = f"DATE '{yesterday}'"
-
-    sess_resp = requests.post(
+def metabase_session() -> dict:
+    """Authenticate and return headers with session token."""
+    resp = requests.post(
         f"{METABASE_URL}/api/session",
         json={"username": METABASE_EMAIL, "password": METABASE_PASSWORD},
         timeout=30,
     )
-    sess_resp.raise_for_status()
-    session_id = sess_resp.json()["id"]
-    headers    = {"X-Metabase-Session": session_id}
+    resp.raise_for_status()
+    return {"X-Metabase-Session": resp.json()["id"]}
 
-    card_resp = requests.get(
-        f"{METABASE_URL}/api/card/{card_id}",
-        headers=headers, timeout=30,
-    )
-    card_resp.raise_for_status()
-    card        = card_resp.json()
-    sql         = card["dataset_query"]["native"]["query"]
-    database_id = card["database_id"]
 
-    sql = re.sub(r"\{\{\s*start_date\s*\}\}", date_sql, sql, flags=re.IGNORECASE)
-    sql = re.sub(r"\{\{\s*end_date\s*\}\}",   date_sql, sql, flags=re.IGNORECASE)
-    # City filter — all reports are BLR only
-    sql = re.sub(r"\{\{\s*City\s*\}\}",       "'BLR'",  sql, flags=re.IGNORECASE)
+def fetch_metabase_csv(card_id: int, city: str = None) -> pd.DataFrame:
+    """
+    Run a saved Metabase card and return the result as a DataFrame.
+    Uses POST /api/card/{id}/query/csv  (what the Metabase UI uses internally).
+    Pass city='BLR' for cards that have a City template-tag filter.
+    """
+    headers = metabase_session()
 
-    payload_dict = {
-        "database": database_id,
-        "type":     "native",
-        "native":   {"query": sql, "template-tags": {}},
-    }
-    encoded = "query=" + urllib.parse.quote(json.dumps(payload_dict), safe="")
+    parameters = []
+    if city:
+        parameters.append({
+            "type":   "text",
+            "target": ["variable", ["template-tag", "City"]],
+            "value":  city,
+        })
 
     csv_resp = requests.post(
-        f"{METABASE_URL}/api/dataset/csv",
-        data=encoded,
-        headers={**headers, "Content-Type": "application/x-www-form-urlencoded"},
+        f"{METABASE_URL}/api/card/{card_id}/query/csv",
+        json={"parameters": parameters},
+        headers=headers,
         timeout=180,
     )
     csv_resp.raise_for_status()
@@ -124,7 +115,7 @@ def clear_and_upload(gc: gspread.Client, sheet_id: str, tab: str, df: pd.DataFra
 # ─────────────────────────────────────────────────────────────
 def process_sweep(gc: gspread.Client) -> pd.DataFrame:
     print("\n── STEP A: Sweep ──")
-    df = fetch_metabase_csv(CARD_ID_SWEEP)
+    df = fetch_metabase_csv(CARD_ID_SWEEP, city='BLR')
     df = df.replace([None], ["NA"], regex=True)
 
     wanted = [
@@ -204,7 +195,7 @@ def fetch_broken_bikes(gc: gspread.Client) -> pd.DataFrame:
 
 def process_stuck(gc: gspread.Client, sweep_df: pd.DataFrame):
     print("\n── STEP C: Stuck / To Be Moved ──")
-    df2 = fetch_metabase_csv(CARD_ID_STUCK)
+    df2 = fetch_metabase_csv(CARD_ID_STUCK, city='BLR')
 
     # Version mapping — actual values include "1.0.0" for Express bikes
     def map_version(v):
