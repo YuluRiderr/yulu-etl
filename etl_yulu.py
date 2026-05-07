@@ -80,7 +80,7 @@ def fetch_metabase_csv(card_id: int, city: str = None) -> pd.DataFrame:
     )
     csv_resp.raise_for_status()
 
-    df = pd.read_csv(io.StringIO(csv_resp.text))
+    df = pd.read_csv(io.StringIO(csv_resp.text), low_memory=False)
     print(f"  [Card {card_id}] {len(df)} rows | cols: {df.columns.tolist()}")
     return df
 
@@ -118,9 +118,10 @@ def clear_and_upload(gc: gspread.Client, sheet_id: str, tab: str, df: pd.DataFra
     ws.batch_clear([f"A2:{last_col}"])
     values = clean_for_sheets(df)
     if values:
+        # FIX: pass values first, then range_name (gspread API change)
         ws.update(
-            f"A2:{last_col}{len(values) + 1}",
             values,
+            f"A2:{last_col}{len(values) + 1}",
             value_input_option="user_entered",
         )
     print(f"  '{tab}' → {len(df)} rows uploaded.")
@@ -222,10 +223,17 @@ def process_stuck(gc: gspread.Client, sweep_df: pd.DataFrame):
 
     df2["version_no"] = df2["version_no"].apply(map_version)
 
-    # Rename "issues" → "updated_part_name" and explode comma-separated parts
-    # e.g. "Motor Controller,Rear View Mirror" → two separate rows
+    # FIX: Card 9705 now returns BOTH 'issues' and 'updated_part_name'.
+    # Renaming 'issues' → 'updated_part_name' when the column already exists
+    # creates a duplicate column, causing pandas to return a DataFrame instead
+    # of a Series on df2["updated_part_name"], which breaks .str accessor.
     if "issues" in df2.columns:
-        df2 = df2.rename(columns={"issues": "updated_part_name"})
+        if "updated_part_name" in df2.columns:
+            # Both exist — drop the redundant 'issues' column
+            df2 = df2.drop(columns=["issues"])
+        else:
+            # Only 'issues' exists — rename it
+            df2 = df2.rename(columns={"issues": "updated_part_name"})
 
     df2["updated_part_name"] = df2["updated_part_name"].astype(str).str.strip()
     df2 = (
