@@ -79,7 +79,7 @@ def fetch_metabase_csv(card_id: int) -> pd.DataFrame:
         "type":     "native",
         "native":   {"query": sql, "template-tags": {}},
     }
-    encoded = "query=" + urllib.parse.quote(json.dumps(payload_dict))
+    encoded = "query=" + urllib.parse.quote(json.dumps(payload_dict), safe="")
 
     csv_resp = requests.post(
         f"{METABASE_URL}/api/dataset/csv",
