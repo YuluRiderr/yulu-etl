@@ -96,11 +96,27 @@ def col_letter(n: int) -> str:
     return result
 
 
+def clean_for_sheets(df: pd.DataFrame) -> list:
+    """
+    Convert DataFrame to a list of lists safe for JSON serialisation.
+    Replaces NaN / inf / None with empty string so gspread never sees
+    out-of-range float values.
+    """
+    df = df.copy()
+    # Replace inf values
+    df = df.replace([float("inf"), float("-inf")], "")
+    # Fill true NaN / NaT
+    df = df.where(pd.notnull(df), "")
+    # Convert everything to string, then clean residual "nan" / "None"
+    str_df = df.astype(str).replace({"nan": "", "NaN": "", "NaT": "", "None": "", "<NA>": ""})
+    return str_df.values.tolist()
+
+
 def clear_and_upload(gc: gspread.Client, sheet_id: str, tab: str, df: pd.DataFrame):
     ws       = gc.open_by_key(sheet_id).worksheet(tab)
     last_col = col_letter(max(len(df.columns), 1))
     ws.batch_clear([f"A2:{last_col}"])
-    values = df.astype(str).values.tolist()
+    values = clean_for_sheets(df)
     if values:
         ws.update(
             f"A2:{last_col}{len(values) + 1}",
