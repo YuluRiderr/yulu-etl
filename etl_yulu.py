@@ -151,8 +151,15 @@ def process_sweep(gc: gspread.Client) -> pd.DataFrame:
     df = df[df["city"].isin(["BLR"])]
     df = df[df["bike_category"].isin(["DeX", "Express"])]
 
-    df["version_group"] = df["version_no"].apply(
-        lambda v: "2x" if str(v).startswith("2.") else ("3x" if str(v).startswith("3.") else "Express")
+    # UPDATED: version_group now checks bike_category first.
+    # Express bikes are always "Express" regardless of version_no.
+    # DeX bikes are classified by version_no prefix: "2." → "2x", "3." → "3x", else "Unknown".
+    df["version_group"] = df.apply(
+        lambda row: "Express" if row["bike_category"] == "Express"
+        else ("2x" if str(row["version_no"]).startswith("2.")
+              else ("3x" if str(row["version_no"]).startswith("3.")
+                    else "Unknown")),
+        axis=1
     )
 
     # FIX: normalise bike IDs so merge works regardless of int/float/string
@@ -330,9 +337,6 @@ def process_stuck(gc: gspread.Client, sweep_df: pd.DataFrame):
     before = len(df_final)
     df_final = df_final[df_final["version_group"].notna()]
     print(f"  After removing non-sweep bikes: {len(df_final)} rows (removed {before - len(df_final)})")
-
-    # NOTE: The reason_map is now applied inside fetch_broken_bikes,
-    # so no second replace needed here. Kept for safety as a no-op.
 
     clear_and_upload(gc, MASTER_SHEET_ID, "To be moved", df_final)
     return df_final, df2
