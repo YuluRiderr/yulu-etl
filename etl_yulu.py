@@ -149,16 +149,17 @@ def process_sweep(gc: gspread.Client) -> pd.DataFrame:
     df = df[[c for c in wanted if c in df.columns]]
 
     df = df[df["city"].isin(["BLR"])]
-    df = df[df["bike_category"].isin(["DeX", "Express"])]
+    # UPDATED: include Miracle bikes alongside DeX and Express
+    df = df[df["bike_category"].isin(["DeX", "Express", "Miracle"])]
 
-    # UPDATED: version_group now checks bike_category first.
-    # Express bikes are always "Express" regardless of version_no.
-    # DeX bikes are classified by version_no prefix: "2." → "2x", "3." → "3x", else "Unknown".
+    # UPDATED: version_group checks bike_category first.
+    # Express → "Express", Miracle → "Miracle", DeX → "2x"/"3x" by version_no prefix.
     df["version_group"] = df.apply(
         lambda row: "Express" if row["bike_category"] == "Express"
-        else ("2x" if str(row["version_no"]).startswith("2.")
-              else ("3x" if str(row["version_no"]).startswith("3.")
-                    else "Unknown")),
+        else ("Miracle" if row["bike_category"] == "Miracle"
+              else ("2x" if str(row["version_no"]).startswith("2.")
+                    else ("3x" if str(row["version_no"]).startswith("3.")
+                          else "Unknown"))),
         axis=1
     )
 
@@ -333,7 +334,7 @@ def process_stuck(gc: gspread.Client, sweep_df: pd.DataFrame):
     df_final = df_final[~df_final["reserved_bike"].isin(["LTR"])]
     print(f"  After removing LTR: {len(df_final)} rows (removed {before - len(df_final)})")
 
-    # Filter out bikes not found in sweep (version_group is NaN = not a BLR DeX/Express bike)
+    # Filter out bikes not found in sweep (version_group is NaN = not a BLR DeX/Express/Miracle bike)
     before = len(df_final)
     df_final = df_final[df_final["version_group"].notna()]
     print(f"  After removing non-sweep bikes: {len(df_final)} rows (removed {before - len(df_final)})")
