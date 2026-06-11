@@ -198,7 +198,7 @@ def fetch_broken_bikes(gc: gspread.Client) -> pd.DataFrame:
     for tab in ["BLR", "BOM", "NCR", "HYD"]:
         ws = sh.worksheet(tab)
         for start_col, end_col in [("G", "H"), ("J", "K")]:
-            data = ws.get(f"{start_col}2:{end_col}1000")
+            data = ws.get(f"{start_col}2:{end_col}10000")
             tmp  = pd.DataFrame(data)
             tmp  = tmp.loc[~tmp.apply(lambda r: (r == "").all(), axis=1)]
             tmp["City"] = tab
