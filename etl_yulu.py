@@ -42,8 +42,6 @@ def get_gspread_client() -> gspread.Client:
 
 # ─────────────────────────────────────────────────────────────
 # METABASE FETCH
-# Uses /api/card/{id}/query/csv  — runs the saved card directly.
-# Avoids 403 issues with raw /api/dataset/csv SQL payloads.
 # ─────────────────────────────────────────────────────────────
 def metabase_session() -> dict:
     """Authenticate and return headers with session token."""
@@ -59,8 +57,6 @@ def metabase_session() -> dict:
 def fetch_metabase_csv(card_id: int, city: str = None) -> pd.DataFrame:
     """
     Run a saved Metabase card and return the result as a DataFrame.
-    Uses POST /api/card/{id}/query/csv  (what the Metabase UI uses internally).
-    Pass city='BLR' for cards that have a City template-tag filter.
     """
     headers = metabase_session()
 
@@ -99,15 +95,10 @@ def col_letter(n: int) -> str:
 def clean_for_sheets(df: pd.DataFrame) -> list:
     """
     Convert DataFrame to a list of lists safe for JSON serialisation.
-    Replaces NaN / inf / None with empty string so gspread never sees
-    out-of-range float values.
     """
     df = df.copy()
-    # Replace inf values
     df = df.replace([float("inf"), float("-inf")], "")
-    # Fill true NaN / NaT
     df = df.where(pd.notnull(df), "")
-    # Convert everything to string, then clean residual "nan" / "None"
     str_df = df.astype(str).replace({"nan": "", "NaN": "", "NaT": "", "None": "", "<NA>": ""})
     return str_df.values.tolist()
 
@@ -118,13 +109,26 @@ def clear_and_upload(gc: gspread.Client, sheet_id: str, tab: str, df: pd.DataFra
     ws.batch_clear([f"A2:{last_col}"])
     values = clean_for_sheets(df)
     if values:
-        # FIX: pass values first, then range_name (gspread API change)
         ws.update(
             values,
             f"A2:{last_col}{len(values) + 1}",
             value_input_option="user_entered",
         )
     print(f"  '{tab}' → {len(df)} rows uploaded.")
+
+
+# ─────────────────────────────────────────────────────────────
+# HELPER: Normalise bike ID to plain string
+# FIX: gspread sometimes returns bike IDs as "5038508.0" (float)
+#      or as int. This strips the .0 and forces string consistently.
+# ─────────────────────────────────────────────────────────────
+def normalise_bike_id(series: pd.Series) -> pd.Series:
+    return (
+        series.astype(str)
+              .str.strip()
+              .str.replace(r"\.0$", "", regex=True)
+              .str.replace(r"\s+", "", regex=True)
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -151,15 +155,15 @@ def process_sweep(gc: gspread.Client) -> pd.DataFrame:
         lambda v: "2x" if str(v).startswith("2.") else ("3x" if str(v).startswith("3.") else "Express")
     )
 
+    # FIX: normalise bike IDs so merge works regardless of int/float/string
+    df["bike"] = normalise_bike_id(df["bike"])
+
     clear_and_upload(gc, MASTER_SHEET_ID, "Sweep", df)
     return df
 
 
 # ─────────────────────────────────────────────────────────────
 # STEP B — OCTOPUS  (card 7433)
-# Columns: city, bike_group, bikes_in_city, LTR, ready,
-#   on_road_faulty, on_road_no_fault, warehouse_tagged,
-#   utilized_bikes, LM
 # ─────────────────────────────────────────────────────────────
 def process_octopus(gc: gspread.Client):
     print("\n── STEP B: Octopus ──")
@@ -188,33 +192,81 @@ def process_octopus(gc: gspread.Client):
 
 # ─────────────────────────────────────────────────────────────
 # STEP C — STUCK / TO BE MOVED  (card 9705)
-# Actual columns: city, cluster, yc_name, bike_name, category,
-#   version_no, at_warehouse, whs_in_epoch, issues
-# "issues" is comma-separated → we explode into one row per part
 # ─────────────────────────────────────────────────────────────
 def fetch_broken_bikes(gc: gspread.Client) -> pd.DataFrame:
     sh       = gc.open_by_url(BROKEN_BIKE_SHEET_URL)
     all_data = []
     for tab in ["BLR", "BOM", "NCR", "HYD"]:
         ws = sh.worksheet(tab)
+        # FIX: raised from 1000 → 10000 so we never silently truncate
         for start_col, end_col in [("G", "H"), ("J", "K")]:
             data = ws.get(f"{start_col}2:{end_col}10000")
-            tmp  = pd.DataFrame(data)
-            tmp  = tmp.loc[~tmp.apply(lambda r: (r == "").all(), axis=1)]
+            if not data:
+                continue
+            tmp = pd.DataFrame(data)
+
+            # Make sure we always have exactly 2 columns even if some rows
+            # only have 1 value (gspread drops trailing empty cells)
+            if tmp.shape[1] == 1:
+                tmp[1] = ""
+            tmp = tmp.iloc[:, :2].copy()
+            tmp.columns = ["bike", "Reason"]
+
+            # Drop rows where BOTH cells are empty
+            tmp = tmp[~((tmp["bike"].astype(str).str.strip() == "") &
+                        (tmp["Reason"].astype(str).str.strip() == ""))]
+
+            # Drop header rows that leaked in (e.g. "bike", "Reason" as values)
+            tmp = tmp[~((tmp["bike"].astype(str).str.lower().str.strip() == "bike") &
+                        (tmp["Reason"].astype(str).str.lower().str.strip() == "reason"))]
+
             tmp["City"] = tab
             all_data.append(tmp)
 
+    if not all_data:
+        print("  WARNING: No data found in broken bikes sheet!")
+        return pd.DataFrame(columns=["bike", "Reason", "City"])
+
     merged = pd.concat(all_data, ignore_index=True)
-    merged = merged.loc[~((merged[0] == "bike") & (merged[1] == "Reason"))]
-    merged.columns = ["bike", "Reason", "City"]
-    return merged.reset_index(drop=True)
+
+    # FIX: normalise bike IDs — gspread may return "5038508.0" or int
+    merged["bike"] = normalise_bike_id(merged["bike"])
+
+    # FIX: normalise Reason to lowercase for consistent matching, then
+    #      map to canonical display names (case-insensitive)
+    merged["Reason"] = merged["Reason"].astype(str).str.strip()
+
+    reason_map = {
+        "chassis damage":            "Chassis Damage",
+        "neck broken beyond repair": "Neck Broken Beyond Repair",
+        "neck broke beyond repair":  "Neck Broken Beyond Repair",
+        "swing arm bush exposed":    "Swing Arm Bush Exposed",
+    }
+    merged["Reason"] = merged["Reason"].str.lower().map(reason_map).fillna(merged["Reason"].str.strip())
+
+    # FIX: drop duplicate (bike, Reason, City) rows from the source sheet
+    before = len(merged)
+    merged = merged.drop_duplicates(subset=["bike", "Reason", "City"])
+    dropped = before - len(merged)
+    if dropped:
+        print(f"  Dropped {dropped} duplicate rows from broken bikes sheet.")
+
+    # Drop rows with clearly invalid/garbled bike IDs
+    # Valid IDs are 7-digit numbers starting with 5
+    valid_mask = merged["bike"].str.match(r"^5\d{6}$")
+    invalid = merged[~valid_mask]
+    if not invalid.empty:
+        print(f"  WARNING: Dropping {len(invalid)} rows with invalid bike IDs: {invalid['bike'].tolist()}")
+    merged = merged[valid_mask].reset_index(drop=True)
+
+    print(f"  Broken bikes sheet total: {len(merged)} rows across {merged['City'].value_counts().to_dict()}")
+    return merged
 
 
 def process_stuck(gc: gspread.Client, sweep_df: pd.DataFrame):
     print("\n── STEP C: Stuck / To Be Moved ──")
     df2 = fetch_metabase_csv(CARD_ID_STUCK, city='BLR')
 
-    # Version mapping — actual values include "1.0.0" for Express bikes
     def map_version(v):
         s = str(v).strip()
         if s.startswith("2."):  return "2x"
@@ -223,16 +275,11 @@ def process_stuck(gc: gspread.Client, sweep_df: pd.DataFrame):
 
     df2["version_no"] = df2["version_no"].apply(map_version)
 
-    # FIX: Card 9705 now returns BOTH 'issues' and 'updated_part_name'.
-    # Renaming 'issues' → 'updated_part_name' when the column already exists
-    # creates a duplicate column, causing pandas to return a DataFrame instead
-    # of a Series on df2["updated_part_name"], which breaks .str accessor.
+    # FIX: handle both 'issues' and 'updated_part_name' columns
     if "issues" in df2.columns:
         if "updated_part_name" in df2.columns:
-            # Both exist — drop the redundant 'issues' column
             df2 = df2.drop(columns=["issues"])
         else:
-            # Only 'issues' exists — rename it
             df2 = df2.rename(columns={"issues": "updated_part_name"})
 
     df2["updated_part_name"] = df2["updated_part_name"].astype(str).str.strip()
@@ -242,6 +289,10 @@ def process_stuck(gc: gspread.Client, sweep_df: pd.DataFrame):
         .reset_index(drop=True)
     )
     df2["updated_part_name"] = df2["updated_part_name"].str.strip()
+
+    # FIX: normalise bike IDs in df2
+    bike_col = "bike_name" if "bike_name" in df2.columns else "bike"
+    df2[bike_col] = normalise_bike_id(df2[bike_col])
 
     # Motor 2x override
     df2.loc[
@@ -253,27 +304,35 @@ def process_stuck(gc: gspread.Client, sweep_df: pd.DataFrame):
     print("  Fetching external broken-bike sheet…")
     broken = fetch_broken_bikes(gc)
 
-    broken["bike"]   = broken["bike"].astype(str).str.strip()
-    sweep_df["bike"] = sweep_df["bike"].astype(str).str.strip()
-
-    df_final = broken.merge(
+    # sweep_df bike IDs already normalised in process_sweep
+    # Just ensure no duplicates in the lookup table
+    sweep_lookup = (
         sweep_df[["bike", "bike_state_id", "reserved_bike", "version_group"]]
-        .drop_duplicates(subset="bike"),
-        on="bike",
-        how="left",
+        .drop_duplicates(subset="bike")
     )
 
-    df_final = df_final[~df_final["bike_state_id"].isin([64, 65])]
-    df_final = df_final[~df_final["reserved_bike"].isin(["LTR"])]
-    df_final = df_final[df_final["version_group"].notna()]
+    print(f"  Broken bikes before merge: {len(broken)}")
+    df_final = broken.merge(sweep_lookup, on="bike", how="left")
+    print(f"  After merge: {len(df_final)} rows")
+    print(f"  Rows with missing bike_state_id (not in sweep): {df_final['bike_state_id'].isna().sum()}")
 
-    reason_map = {
-        "Chassis damage":            "Chassis Damage",
-        "Neck broke beyond repair":  "Neck Broken Beyond Repair",
-        "Neck broken beyond repair": "Neck Broken Beyond Repair",
-        "swing arm bush exposed":    "Swing Arm Bush Exposed",
-    }
-    df_final["Reason"] = df_final["Reason"].replace(reason_map)
+    # Filter out bikes already in state 64 or 65
+    before = len(df_final)
+    df_final = df_final[~df_final["bike_state_id"].isin([64, 65])]
+    print(f"  After removing state 64/65: {len(df_final)} rows (removed {before - len(df_final)})")
+
+    # Filter out LTR reserved bikes
+    before = len(df_final)
+    df_final = df_final[~df_final["reserved_bike"].isin(["LTR"])]
+    print(f"  After removing LTR: {len(df_final)} rows (removed {before - len(df_final)})")
+
+    # Filter out bikes not found in sweep (version_group is NaN = not a BLR DeX/Express bike)
+    before = len(df_final)
+    df_final = df_final[df_final["version_group"].notna()]
+    print(f"  After removing non-sweep bikes: {len(df_final)} rows (removed {before - len(df_final)})")
+
+    # NOTE: The reason_map is now applied inside fetch_broken_bikes,
+    # so no second replace needed here. Kept for safety as a no-op.
 
     clear_and_upload(gc, MASTER_SHEET_ID, "To be moved", df_final)
     return df_final, df2
@@ -291,7 +350,7 @@ def process_parts_summary(gc: gspread.Client, df_final: pd.DataFrame, df2: pd.Da
     )
 
     bike_col      = "bike_name" if "bike_name" in df2.columns else "bike"
-    df2[bike_col] = df2[bike_col].astype(str).str.strip()
+    df2[bike_col] = normalise_bike_id(df2[bike_col])
     df2_clean     = df2[~df2[bike_col].isin(severe_bikes)].copy()
 
     clear_and_upload(gc, MASTER_SHEET_ID, "Stuck", df2_clean)
