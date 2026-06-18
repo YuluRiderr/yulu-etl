@@ -284,12 +284,20 @@ def fetch_broken_bikes(gc: gspread.Client) -> pd.DataFrame:
     if dropped:
         print(f"  Dropped {dropped} duplicate rows from broken bikes sheet.")
 
-    # Drop rows with clearly invalid/garbled bike IDs
-    # Valid IDs are 7-digit numbers starting with 5
-    valid_mask = merged["bike"].str.match(r"^5\d{6}$")
+    # Drop rows with clearly invalid/garbled bike IDs.
+    # FIX: was r"^5\d{6}$" — wrongly assumed every bike ID is a 7-digit
+    # number starting with "5". Express bikes use a different numbering
+    # scheme (e.g. 3001032), so that regex was silently discarding every
+    # Express bike in the sheet before it ever reached the Sweep merge.
+    # Now we only drop entries that aren't a plain digit string at all
+    # (blank cells, the literal "nan", stray text) — anything that's a
+    # real bike ID but doesn't exist in Sweep will still surface later
+    # via the "not in sweep at all" diagnostic in process_stuck, which is
+    # the right place to catch genuinely bogus IDs.
+    valid_mask = merged["bike"].str.match(r"^\d+$")
     invalid = merged[~valid_mask]
     if not invalid.empty:
-        print(f"  WARNING: Dropping {len(invalid)} rows with invalid bike IDs: {invalid['bike'].tolist()}")
+        print(f"  WARNING: Dropping {len(invalid)} rows with non-numeric bike IDs: {invalid['bike'].tolist()}")
     merged = merged[valid_mask].reset_index(drop=True)
 
     print(f"  Broken bikes sheet total: {len(merged)} rows across {merged['City'].value_counts().to_dict()}")
