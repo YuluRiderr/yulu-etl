@@ -2,6 +2,17 @@
 Yulu ETL — Sweep / Octopus / Stuck / Parts Summary
 Fetches from Metabase, processes with pandas, pushes to Google Sheets.
 Run daily via GitHub Actions at 1 AM IST.
+
+PATCH NOTE (this version, BLR-only):
+  Sweep, Stuck, and the external broken-bike sheet are all scoped to BLR
+  only now (the broken-bike fetch used to also pull BOM/NCR/HYD tabs even
+  though only BLR was processed downstream — that inflated the "missing
+  bike_state_id" count with bikes that could never match, hiding the real
+  BLR-only mismatches in the noise).
+  Also added: the unmatched bike IDs are now printed explicitly (not just
+  a count) wherever a broken-bike entry has no match in Sweep, so you can
+  check those specific bike numbers in Metabase to find the real cause
+  (decommissioned, wrong bike_category, typo, etc).
 """
 
 import io
@@ -21,6 +32,9 @@ METABASE_PASSWORD = os.environ["METABASE_PASSWORD"]
 CARD_ID_SWEEP   = 654
 CARD_ID_OCTOPUS = 7433
 CARD_ID_STUCK   = 9705
+
+# BLR-only scope
+CITY = "BLR"
 
 MASTER_SHEET_ID       = "1fBjHKwlxRGwjsOSjzHOB6cUjvaKrhvtXdaPGeZjZuH0"
 BROKEN_BIKE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1eGDS2Sj33Gqk63QxmOzw302f05v_WoeSqSZr7Oz2dTE/edit"
@@ -77,7 +91,7 @@ def fetch_metabase_csv(card_id: int, city: str = None) -> pd.DataFrame:
     csv_resp.raise_for_status()
 
     df = pd.read_csv(io.StringIO(csv_resp.text), low_memory=False)
-    print(f"  [Card {card_id}] {len(df)} rows | cols: {df.columns.tolist()}")
+    print(f"  [Card {card_id}] city={city or 'ALL'} | {len(df)} rows | cols: {df.columns.tolist()}")
     return df
 
 
@@ -136,8 +150,18 @@ def normalise_bike_id(series: pd.Series) -> pd.Series:
 # ─────────────────────────────────────────────────────────────
 def process_sweep(gc: gspread.Client) -> pd.DataFrame:
     print("\n── STEP A: Sweep ──")
-    df = fetch_metabase_csv(CARD_ID_SWEEP, city='BLR')
+    df = fetch_metabase_csv(CARD_ID_SWEEP, city=CITY)
     df = df.replace([None], ["NA"], regex=True)
+
+    # FIX: normalise bike IDs early, before any category filtering, so the
+    # diagnostic lookup below can tell "not in Sweep at all" apart from
+    # "in Sweep but filtered out by bike_category".
+    df["bike"] = normalise_bike_id(df["bike"])
+
+    # DIAGNOSTIC: keep a category lookup of every bike returned for this
+    # city, *before* restricting to DeX/Express/Miracle. Used later to
+    # explain unmatched bikes instead of just counting them.
+    all_categories_lookup = df[["bike", "bike_category"]].drop_duplicates(subset="bike")
 
     wanted = [
         "city", "bike", "bike_category", "bike_group", "at_warehouse",
@@ -148,7 +172,7 @@ def process_sweep(gc: gspread.Client) -> pd.DataFrame:
     ]
     df = df[[c for c in wanted if c in df.columns]]
 
-    df = df[df["city"].isin(["BLR"])]
+    df = df[df["city"].isin([CITY])]
     # UPDATED: include Miracle bikes alongside DeX and Express
     df = df[df["bike_category"].isin(["DeX", "Express", "Miracle"])]
 
@@ -163,10 +187,8 @@ def process_sweep(gc: gspread.Client) -> pd.DataFrame:
         axis=1
     )
 
-    # FIX: normalise bike IDs so merge works regardless of int/float/string
-    df["bike"] = normalise_bike_id(df["bike"])
-
     clear_and_upload(gc, MASTER_SHEET_ID, "Sweep", df)
+    df.attrs["all_categories_lookup"] = all_categories_lookup
     return df
 
 
@@ -204,7 +226,10 @@ def process_octopus(gc: gspread.Client):
 def fetch_broken_bikes(gc: gspread.Client) -> pd.DataFrame:
     sh       = gc.open_by_url(BROKEN_BIKE_SHEET_URL)
     all_data = []
-    for tab in ["BLR", "BOM", "NCR", "HYD"]:
+    # PATCH: only the BLR tab now — was looping ["BLR", "BOM", "NCR", "HYD"]
+    # which pulled in bikes from other cities that could never match the
+    # BLR-only Sweep data, inflating the "missing bike_state_id" count.
+    for tab in [CITY]:
         ws = sh.worksheet(tab)
         # FIX: raised from 1000 → 10000 so we never silently truncate
         for start_col, end_col in [("G", "H"), ("J", "K")]:
@@ -273,7 +298,7 @@ def fetch_broken_bikes(gc: gspread.Client) -> pd.DataFrame:
 
 def process_stuck(gc: gspread.Client, sweep_df: pd.DataFrame):
     print("\n── STEP C: Stuck / To Be Moved ──")
-    df2 = fetch_metabase_csv(CARD_ID_STUCK, city='BLR')
+    df2 = fetch_metabase_csv(CARD_ID_STUCK, city=CITY)
 
     def map_version(v):
         s = str(v).strip()
@@ -322,7 +347,25 @@ def process_stuck(gc: gspread.Client, sweep_df: pd.DataFrame):
     print(f"  Broken bikes before merge: {len(broken)}")
     df_final = broken.merge(sweep_lookup, on="bike", how="left")
     print(f"  After merge: {len(df_final)} rows")
-    print(f"  Rows with missing bike_state_id (not in sweep): {df_final['bike_state_id'].isna().sum()}")
+
+    missing_mask = df_final["bike_state_id"].isna()
+    print(f"  Rows with missing bike_state_id (not in sweep): {missing_mask.sum()}")
+
+    # DIAGNOSTIC: print the actual unmatched bike IDs, and explain *why*
+    # each one didn't match — not found in Sweep at all for this city, vs.
+    # found but excluded by the DeX/Express/Miracle category filter.
+    if missing_mask.any():
+        missing_bikes = df_final.loc[missing_mask, "bike"].tolist()
+        cat_lookup = sweep_df.attrs.get("all_categories_lookup")
+        if cat_lookup is not None:
+            found_other_cat = cat_lookup[cat_lookup["bike"].isin(missing_bikes)]
+            not_in_sweep_at_all = set(missing_bikes) - set(found_other_cat["bike"])
+            print(f"  -> {len(found_other_cat)} of these exist in Sweep but with a "
+                  f"different bike_category: {found_other_cat.set_index('bike')['bike_category'].to_dict()}")
+            print(f"  -> {len(not_in_sweep_at_all)} of these don't appear in the "
+                  f"Sweep extract for {CITY} at all: {sorted(not_in_sweep_at_all)}")
+        else:
+            print(f"  -> Unmatched bike IDs: {missing_bikes}")
 
     # Filter out bikes already in state 64 or 65
     before = len(df_final)
@@ -334,7 +377,7 @@ def process_stuck(gc: gspread.Client, sweep_df: pd.DataFrame):
     df_final = df_final[~df_final["reserved_bike"].isin(["LTR"])]
     print(f"  After removing LTR: {len(df_final)} rows (removed {before - len(df_final)})")
 
-    # Filter out bikes not found in sweep (version_group is NaN = not a BLR DeX/Express/Miracle bike)
+    # Filter out bikes not found in sweep (version_group is NaN = not a sweep-matched DeX/Express/Miracle bike)
     before = len(df_final)
     df_final = df_final[df_final["version_group"].notna()]
     print(f"  After removing non-sweep bikes: {len(df_final)} rows (removed {before - len(df_final)})")
