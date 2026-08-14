@@ -29,15 +29,22 @@ METABASE_URL      = os.environ["METABASE_URL"].rstrip("/")
 METABASE_EMAIL    = os.environ["METABASE_EMAIL"]
 METABASE_PASSWORD = os.environ["METABASE_PASSWORD"]
 
-CARD_ID_SWEEP   = 654
-CARD_ID_OCTOPUS = 7433
-CARD_ID_STUCK   = 9705
+CARD_ID_SWEEP     = 654
+CARD_ID_OCTOPUS   = 7433
+CARD_ID_STUCK     = 9705
+CARD_ID_WAREHOUSE = 6214
 
 # BLR-only scope
 CITY = "BLR"
 
 MASTER_SHEET_ID       = "1fBjHKwlxRGwjsOSjzHOB6cUjvaKrhvtXdaPGeZjZuH0"
 BROKEN_BIKE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1eGDS2Sj33Gqk63QxmOzw302f05v_WoeSqSZr7Oz2dTE/edit"
+
+# Columns to pull from the "Bikes in Warehouse" card (6214) — nothing else.
+WAREHOUSE_COLUMNS = [
+    "city", "cluster", "yc_name", "bike_name", "category", "version_no",
+    "Version NO", "issues", "part_name", "updated_part_name", "No of Faults",
+]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -129,6 +136,34 @@ def clear_and_upload(gc: gspread.Client, sheet_id: str, tab: str, df: pd.DataFra
             value_input_option="user_entered",
         )
     print(f"  '{tab}' → {len(df)} rows uploaded.")
+
+
+def update_columns_only(gc: gspread.Client, sheet_id: str, tab: str, df: pd.DataFrame):
+    """
+    Like clear_and_upload, but scoped strictly to the exact block of rows
+    and columns being written — never a full-sheet/full-column clear.
+
+    - Column range: A .. (letter for len(df.columns)) — only the columns
+      this dataframe actually has, nothing wider.
+    - Row range: 2 .. (2 + len(values) - 1) — only as many rows as we're
+      about to write, not an unbounded clear down the whole column.
+
+    Use this instead of clear_and_upload whenever the destination tab may
+    contain other data/columns outside this dataframe's own columns/rows
+    that must not be touched.
+    """
+    ws       = gc.open_by_key(sheet_id).worksheet(tab)
+    last_col = col_letter(max(len(df.columns), 1))
+    values   = clean_for_sheets(df)
+
+    if not values:
+        print(f"  '{tab}' → no rows to write, skipping (nothing cleared).")
+        return
+
+    target_range = f"A2:{last_col}{len(values) + 1}"
+    ws.batch_clear([target_range])
+    ws.update(values, target_range, value_input_option="user_entered")
+    print(f"  '{tab}' → {len(df)} rows updated in {target_range} (columns A:{last_col} only).")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -475,6 +510,42 @@ def process_parts_summary(gc: gspread.Client, df_final: pd.DataFrame, df2: pd.Da
 
 
 # ─────────────────────────────────────────────────────────────
+# STEP E — BIKES IN WAREHOUSE  (card 6214)
+# ─────────────────────────────────────────────────────────────
+def process_warehouse(gc: gspread.Client) -> pd.DataFrame:
+    """
+    Pulls only WAREHOUSE_COLUMNS from card 6214, filtered to BLR, and writes
+    them to the 'Bikes_WHS' tab.
+
+    Unlike the other steps, this does NOT use clear_and_upload — the
+    destination tab is only ever touched via update_columns_only, which
+    clears/updates strictly the A:{last_col} x 2:{n_rows+1} block this
+    dataframe occupies. It never does a full-sheet or unbounded-column
+    clear, so nothing outside these columns/rows in 'Bikes_WHS' is
+    touched.
+    """
+    print("\n── STEP E: Bikes in Warehouse ──")
+    df = fetch_metabase_csv(CARD_ID_WAREHOUSE, city=CITY)
+
+    # Filter to BLR only (in case the card doesn't already scope by the
+    # City parameter, or returns other cities alongside it).
+    if "city" in df.columns:
+        df = df[df["city"] == CITY]
+
+    # Keep only the requested columns, in the requested order. Anything
+    # not present in the card's output is simply skipped rather than
+    # erroring, so a renamed/missing column upstream doesn't break the run.
+    present = [c for c in WAREHOUSE_COLUMNS if c in df.columns]
+    missing = [c for c in WAREHOUSE_COLUMNS if c not in df.columns]
+    if missing:
+        print(f"  NOTE: card {CARD_ID_WAREHOUSE} is missing expected columns: {missing}")
+    df = df[present]
+
+    update_columns_only(gc, MASTER_SHEET_ID, "Bikes_WHS", df)
+    return df
+
+
+# ─────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────
 def main():
@@ -485,6 +556,7 @@ def main():
     process_octopus(gc)
     df_final, df2 = process_stuck(gc, sweep_df)
     process_parts_summary(gc, df_final, df2)
+    process_warehouse(gc)
 
     print("\n✅ ETL complete.")
 
