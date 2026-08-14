@@ -40,11 +40,40 @@ CITY = "BLR"
 MASTER_SHEET_ID       = "1fBjHKwlxRGwjsOSjzHOB6cUjvaKrhvtXdaPGeZjZuH0"
 BROKEN_BIKE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1eGDS2Sj33Gqk63QxmOzw302f05v_WoeSqSZr7Oz2dTE/edit"
 
-# Columns to pull from the "Bikes in Warehouse" card (6214) — nothing else.
-WAREHOUSE_COLUMNS = [
+# "Bikes in Warehouse" card (6214) actually returns these columns.
+# `city` is used only to filter to BLR — it isn't written to the sheet.
+# `at_warehouse` / `whs_in_epoch` aren't needed downstream, so they're
+# fetched but dropped before writing.
+WAREHOUSE_METABASE_COLUMNS = [
     "city", "cluster", "yc_name", "bike_name", "category", "version_no",
-    "Version NO", "issues", "part_name", "updated_part_name", "No of Faults",
+    "at_warehouse", "whs_in_epoch", "issues", "part_name", "updated_part_name",
 ]
+
+# Maps each Metabase column we DO write to its exact column letter in the
+# 'Bikes_WHS' tab. Columns NOT in this map (Version NO, No of Faults, Flag,
+# Fault Buckets, Stuck Part, State id) are sheet-side formulas and must
+# never be cleared or written to — including ones like "Version NO" (F)
+# that sit *between* two of our data columns (E and G).
+WAREHOUSE_SHEET_COLUMN_MAP = {
+    "cluster":           "A",
+    "yc_name":            "B",
+    "bike_name":          "C",
+    "category":           "D",
+    "version_no":         "E",
+    # column F ("Version NO") is a formula — intentionally not mapped
+    "issues":             "G",
+    "part_name":          "H",
+    "updated_part_name":  "I",
+    # columns J–N (No of Faults, Flag, Fault Buckets, Stuck Part, State id)
+    # are formulas — intentionally not mapped
+}
+
+
+def letter_to_index(letter: str) -> int:
+    idx = 0
+    for ch in letter:
+        idx = idx * 26 + (ord(ch.upper()) - ord("A") + 1)
+    return idx
 
 
 # ─────────────────────────────────────────────────────────────
@@ -138,32 +167,65 @@ def clear_and_upload(gc: gspread.Client, sheet_id: str, tab: str, df: pd.DataFra
     print(f"  '{tab}' → {len(df)} rows uploaded.")
 
 
-def update_columns_only(gc: gspread.Client, sheet_id: str, tab: str, df: pd.DataFrame):
+def update_named_columns(gc: gspread.Client, sheet_id: str, tab: str,
+                          df: pd.DataFrame, column_letters: dict):
     """
-    Like clear_and_upload, but scoped strictly to the exact block of rows
-    and columns being written — never a full-sheet/full-column clear.
+    Update ONLY the specific named columns given in `column_letters`
+    (a {df_column_name: sheet_column_letter} map), leaving every other
+    column in `tab` — including formula columns sitting between two of
+    our target columns — completely untouched.
 
-    - Column range: A .. (letter for len(df.columns)) — only the columns
-      this dataframe actually has, nothing wider.
-    - Row range: 2 .. (2 + len(values) - 1) — only as many rows as we're
-      about to write, not an unbounded clear down the whole column.
-
-    Use this instead of clear_and_upload whenever the destination tab may
-    contain other data/columns outside this dataframe's own columns/rows
-    that must not be touched.
+    - Row range: row 2 down to the sheet's last row is CLEARED (so no
+      stale rows linger below this run's data if today's fetch is
+      shorter than a previous one), then the new values are written
+      starting at row 2. Row 1 (the header) is never touched.
+    - Column range: target columns are grouped into contiguous runs
+      (e.g. A:E) and each run is cleared/written as its own separate
+      range. A gap (a column between two targets that isn't in the map,
+      like a formula column) breaks the run, so that gap column is
+      never included in any clear/update call.
     """
-    ws       = gc.open_by_key(sheet_id).worksheet(tab)
-    last_col = col_letter(max(len(df.columns), 1))
-    values   = clean_for_sheets(df)
+    ws = gc.open_by_key(sheet_id).worksheet(tab)
+    last_row = max(ws.row_count, 2)  # sheet's actual last row; never below 2
 
-    if not values:
+    ordered = sorted(
+        ((col, column_letters[col]) for col in df.columns if col in column_letters),
+        key=lambda pair: letter_to_index(pair[1]),
+    )
+    if not ordered:
+        print(f"  '{tab}' → no matching columns to update, skipping.")
+        return
+
+    ordered_cols = [col for col, _ in ordered]
+    values_all   = clean_for_sheets(df[ordered_cols])
+    n_rows       = len(values_all)
+    if n_rows == 0:
         print(f"  '{tab}' → no rows to write, skipping (nothing cleared).")
         return
 
-    target_range = f"A2:{last_col}{len(values) + 1}"
-    ws.batch_clear([target_range])
-    ws.update(values, target_range, value_input_option="user_entered")
-    print(f"  '{tab}' → {len(df)} rows updated in {target_range} (columns A:{last_col} only).")
+    # Split into contiguous column runs (e.g. A-E, then G-I) so a formula
+    # column in between (like F) never falls inside a clear/update range.
+    groups = [[ordered[0]]]
+    for prev, curr in zip(ordered, ordered[1:]):
+        if letter_to_index(curr[1]) == letter_to_index(prev[1]) + 1:
+            groups[-1].append(curr)
+        else:
+            groups.append([curr])
+
+    col_offset = 0
+    for group in groups:
+        width        = len(group)
+        start_letter = group[0][1]
+        end_letter   = group[-1][1]
+        sub_values   = [row[col_offset:col_offset + width] for row in values_all]
+        col_offset  += width
+
+        clear_range  = f"{start_letter}2:{end_letter}{last_row}"
+        write_range  = f"{start_letter}2:{end_letter}{n_rows + 1}"
+        ws.batch_clear([clear_range])
+        ws.update(sub_values, write_range, value_input_option="user_entered")
+        print(f"  '{tab}' → cleared {clear_range}, wrote {n_rows} rows to {write_range} "
+              f"({', '.join(c for c, _ in group)}).")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -514,15 +576,10 @@ def process_parts_summary(gc: gspread.Client, df_final: pd.DataFrame, df2: pd.Da
 # ─────────────────────────────────────────────────────────────
 def process_warehouse(gc: gspread.Client) -> pd.DataFrame:
     """
-    Pulls only WAREHOUSE_COLUMNS from card 6214, filtered to BLR, and writes
-    them to the 'Bikes_WHS' tab.
-
-    Unlike the other steps, this does NOT use clear_and_upload — the
-    destination tab is only ever touched via update_columns_only, which
-    clears/updates strictly the A:{last_col} x 2:{n_rows+1} block this
-    dataframe occupies. It never does a full-sheet or unbounded-column
-    clear, so nothing outside these columns/rows in 'Bikes_WHS' is
-    touched.
+    Pulls the "Bikes in Warehouse" card (6214), filtered to BLR, and writes
+    only the Metabase-sourced columns into the 'Bikes_WHS' tab — via
+    update_named_columns, which touches only A:E and G:I (per
+    WAREHOUSE_SHEET_COLUMN_MAP), never the formula columns F, J, K, L, M, N.
     """
     print("\n── STEP E: Bikes in Warehouse ──")
     df = fetch_metabase_csv(CARD_ID_WAREHOUSE, city=CITY)
@@ -532,16 +589,16 @@ def process_warehouse(gc: gspread.Client) -> pd.DataFrame:
     if "city" in df.columns:
         df = df[df["city"] == CITY]
 
-    # Keep only the requested columns, in the requested order. Anything
-    # not present in the card's output is simply skipped rather than
-    # erroring, so a renamed/missing column upstream doesn't break the run.
-    present = [c for c in WAREHOUSE_COLUMNS if c in df.columns]
-    missing = [c for c in WAREHOUSE_COLUMNS if c not in df.columns]
+    missing = [c for c in WAREHOUSE_METABASE_COLUMNS if c not in df.columns]
     if missing:
         print(f"  NOTE: card {CARD_ID_WAREHOUSE} is missing expected columns: {missing}")
-    df = df[present]
 
-    update_columns_only(gc, MASTER_SHEET_ID, "Bikes_WHS", df)
+    # Only keep columns we actually write to the sheet (drops city,
+    # at_warehouse, whs_in_epoch — none of those go to 'Bikes_WHS').
+    keep = [c for c in WAREHOUSE_SHEET_COLUMN_MAP if c in df.columns]
+    df = df[keep]
+
+    update_named_columns(gc, MASTER_SHEET_ID, "Bikes_WHS", df, WAREHOUSE_SHEET_COLUMN_MAP)
     return df
 
 
