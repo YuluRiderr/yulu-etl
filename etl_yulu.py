@@ -265,7 +265,7 @@ def process_sweep(gc: gspread.Client) -> pd.DataFrame:
         "nearest_yz", "no_of_days_since_rnt", "flag_bike_fault",
         "reserved_bike", "on_biker_map", "on_fleet_map", "is_test_vehicle",
         "flag_stolen", "flag_unavailable", "bike_state_id", "version_no",
-        "operational_cluster",
+        "operational_cluster","last_rtd_dt",
     ]
     df = df[[c for c in wanted if c in df.columns]]
 
