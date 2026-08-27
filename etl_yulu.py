@@ -13,6 +13,20 @@ PATCH NOTE (this version, BLR-only):
   a count) wherever a broken-bike entry has no match in Sweep, so you can
   check those specific bike numbers in Metabase to find the real cause
   (decommissioned, wrong bike_category, typo, etc).
+
+PATCH NOTE (this version, Octopus Type fix):
+  process_octopus() used to map bike_group -> Type with a plain dict
+  `.map()`. Any bike_group value not present as an exact key (e.g. a new
+  variant like "DeX 3.5 GR" that was never added to the dict) silently
+  became NaN, which clean_for_sheets() then turned into a blank cell in
+  the 'Type' column — no warning, no error, easy to miss on the sheet.
+  Now classify_bike_group() first checks the explicit dict (unchanged
+  behaviour for all known values), and falls back to a prefix-based rule
+  (DeX -> 2x/3x by version number, Express -> Express, Miracle ->
+  Miracle) for anything new. Anything that STILL can't be classified is
+  left blank as before, but now prints a warning listing exactly which
+  bike_group values were unmapped, so it gets caught in the run log
+  instead of silently going blank in the sheet.
 """
 
 import io
@@ -292,27 +306,83 @@ def process_sweep(gc: gspread.Client) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────
 # STEP B — OCTOPUS  (card 7433)
 # ─────────────────────────────────────────────────────────────
+
+# Explicit bike_group -> Type map. Checked first; any value found here
+# uses this mapping exactly (unchanged behaviour from before).
+OCTOPUS_TYPE_MAP = {
+    "DeX 2.0":               "2x",
+    "DeX 2.5":               "2x",
+    "DeX 3.2 GR":            "3x",
+    "DeX 3.3 GR":            "3x",
+    "Dex_3.0 GR":            "3x",
+    "Express BGAUSS":        "Express",
+    "Express MV":            "Express",
+    "Express NYX":           "Express",
+    "Express Yadea Y1S Pro": "Express",
+    "Miracle 2.0":           "Miracle",
+    "Miracle 2.5":           "Miracle",
+    "Miracle 3.0 GR":        "Miracle",
+    "Miracle 3.1 GR":        "Miracle",
+    "Miracle 3.2 GR":        "Miracle",
+}
+
+
+def classify_bike_group(bike_group) -> str:
+    """
+    Classify a bike_group string into 2x / 3x / Express / Miracle.
+
+    FIX: the old code was a plain dict `.map(OCTOPUS_TYPE_MAP)`, so any
+    bike_group value not already an exact key (e.g. a new variant like
+    "DeX 3.5 GR" that was never added to the dict) silently became NaN,
+    which then rendered as a blank 'Type' cell on the sheet — no warning.
+
+    Now: exact dict match first (identical behaviour to before for every
+    known value). If it's not in the dict, fall back to a prefix-based
+    guess so new variants still get classified:
+      - starts with "DeX"     -> "2x" if version has "2.", "3x" if "3."
+      - starts with "Express" -> "Express"
+      - starts with "Miracle" -> "Miracle"
+    If neither the dict nor the fallback can classify it, return None
+    (still renders as a blank cell, same as before) — but the caller
+    prints a warning listing every value that fell through, so it shows
+    up in the run log instead of only being visible as a blank cell on
+    the sheet.
+    """
+    bg = str(bike_group).strip()
+
+    if bg in OCTOPUS_TYPE_MAP:
+        return OCTOPUS_TYPE_MAP[bg]
+
+    if bg.startswith("DeX") or bg.startswith("Dex"):
+        if "2." in bg:
+            return "2x"
+        if "3." in bg:
+            return "3x"
+        return None
+
+    if bg.startswith("Express"):
+        return "Express"
+
+    if bg.startswith("Miracle"):
+        return "Miracle"
+
+    return None
+
+
 def process_octopus(gc: gspread.Client):
     print("\n── STEP B: Octopus ──")
     df1 = fetch_metabase_csv(CARD_ID_OCTOPUS)
 
-    mapping = {
-        "DeX 2.0":               "2x",
-        "DeX 2.5":               "2x",
-        "DeX 3.2 GR":            "3x",
-        "DeX 3.3 GR":            "3x",
-        "Dex_3.0 GR":            "3x",
-        "Express BGAUSS":        "Express",
-        "Express MV":            "Express",
-        "Express NYX":           "Express",
-        "Express Yadea Y1S Pro": "Express",
-        "Miracle 2.0":           "Miracle",
-        "Miracle 2.5":           "Miracle",
-        "Miracle 3.0 GR":        "Miracle",
-        "Miracle 3.1 GR":        "Miracle",
-        "Miracle 3.2 GR":        "Miracle",
-    }
-    df1["Type"] = df1["bike_group"].map(mapping)
+    df1["Type"] = df1["bike_group"].apply(classify_bike_group)
+
+    # WARNING: surface any bike_group values that still couldn't be
+    # classified (neither an exact dict match nor a DeX/Express/Miracle
+    # prefix), so these show up in the run log instead of only as a
+    # silent blank cell in the 'Type' column on the sheet.
+    unmapped = sorted(df1.loc[df1["Type"].isna(), "bike_group"].dropna().unique().tolist())
+    if unmapped:
+        print(f"  WARNING: {len(unmapped)} bike_group value(s) in Octopus could not be "
+              f"classified into a Type and will show blank on the sheet: {unmapped}")
 
     clear_and_upload(gc, MASTER_SHEET_ID, "Octopus", df1)
 
