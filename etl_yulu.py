@@ -181,7 +181,7 @@ def metabase_session() -> dict:
     return {"X-Metabase-Session": resp.json()["id"]}
 
 
-def fetch_metabase_csv(card_id: int, city: str = None) -> pd.DataFrame:
+def fetch_metabase_csv(card_id: int, city: str = None, city_tag: str = "City") -> pd.DataFrame:
     """
     Run a saved Metabase card and return the result as a DataFrame.
 
@@ -196,6 +196,19 @@ def fetch_metabase_csv(card_id: int, city: str = None) -> pd.DataFrame:
     in pandas afterward, which is why the final sheet output was still
     correct -- this fix only removes the ~3x wasted fetch/transfer, it
     doesn't change any existing tab's contents.
+
+    `city_tag` FIX (also confirmed live): the City template-tag's exact
+    NAME is inconsistent across cards -- confirmed capital "City" on
+    Sweep (654), but lowercase "city" on Stuck (9705) and Warehouse
+    (6214). Targeting a template-tag name that doesn't exist on a given
+    card causes Metabase to throw an unhandled 500 (unlike a genuinely
+    *unfilled* existing tag, which fails gracefully with a 200 + JSON
+    error body -- see _looks_like_metabase_error_payload). This is why
+    the old json= bug never surfaced this: an unbound parameter was
+    silently dropped entirely rather than validated against the card's
+    real tag names. Each caller now passes the tag name that actually
+    matches its card (checked directly against each card's
+    dataset_query.native.template-tags).
     """
     headers = metabase_session()
 
@@ -203,7 +216,7 @@ def fetch_metabase_csv(card_id: int, city: str = None) -> pd.DataFrame:
     if city:
         parameters.append({
             "type":   "text",
-            "target": ["variable", ["template-tag", "City"]],
+            "target": ["variable", ["template-tag", city_tag]],
             "value":  city,
         })
 
@@ -795,7 +808,7 @@ def fetch_broken_bikes(gc: gspread.Client) -> pd.DataFrame:
 
 def process_stuck(gc: gspread.Client, sweep_df: pd.DataFrame):
     print("\n── STEP C: Stuck / To Be Moved ──")
-    df2 = fetch_metabase_csv(CARD_ID_STUCK, city=CITY)
+    df2 = fetch_metabase_csv(CARD_ID_STUCK, city=CITY, city_tag="city")
 
     def map_version(v):
         s = str(v).strip()
@@ -974,10 +987,11 @@ def process_warehouse(gc: gspread.Client) -> pd.DataFrame:
     WAREHOUSE_SHEET_COLUMN_MAP), never the formula columns F, J, K, L, M, N.
     """
     print("\n── STEP E: Bikes in Warehouse ──")
-    df = fetch_metabase_csv(CARD_ID_WAREHOUSE, city=CITY)
+    # No server-side city parameter here (per explicit decision) -- fetch
+    # everything and rely entirely on the client-side filter below.
+    df = fetch_metabase_csv(CARD_ID_WAREHOUSE)
 
-    # Filter to BLR only (in case the card doesn't already scope by the
-    # City parameter, or returns other cities alongside it).
+    # Filter to BLR only (the only city filtering this step does now).
     if "city" in df.columns:
         df = df[df["city"] == CITY]
 
