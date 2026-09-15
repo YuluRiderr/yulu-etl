@@ -60,6 +60,7 @@ PATCH NOTE (this version, Daily Ops Metrics added):
 """
 
 import io
+import json
 import os
 from datetime import datetime, timedelta
 from functools import wraps
@@ -183,6 +184,18 @@ def metabase_session() -> dict:
 def fetch_metabase_csv(card_id: int, city: str = None) -> pd.DataFrame:
     """
     Run a saved Metabase card and return the result as a DataFrame.
+
+    FIX (confirmed live against reports.yulu.bike): the /query/csv export
+    endpoint requires a FORM-ENCODED body with `parameters` as a
+    JSON-*string* field -- a raw `json=` body (the previous behaviour
+    here) is accepted with HTTP 200, but the City parameter is never
+    actually bound server-side, so this was silently fetching EVERY
+    city's full data on every call (verified directly: 71,925 rows via
+    the old json= body vs 23,943 via the fixed form-encoded body for card
+    654 alone). Every caller of this function already re-filters by city
+    in pandas afterward, which is why the final sheet output was still
+    correct -- this fix only removes the ~3x wasted fetch/transfer, it
+    doesn't change any existing tab's contents.
     """
     headers = metabase_session()
 
@@ -196,7 +209,7 @@ def fetch_metabase_csv(card_id: int, city: str = None) -> pd.DataFrame:
 
     csv_resp = requests.post(
         f"{METABASE_URL}/api/card/{card_id}/query/csv",
-        json={"parameters": parameters},
+        data={"parameters": json.dumps(parameters)},
         headers=headers,
         timeout=180,
     )
@@ -306,6 +319,22 @@ def fetch_metabase_csv_range(card_id: int, start_date: str, end_date: str,
     before being handed to pd.read_csv. ignore_cache defaults to True
     since STEP F always asks for a specific already-closed day — a stale
     cached answer for that day is never desirable here.
+
+    FIX (confirmed live against reports.yulu.bike): unlike the plain
+    /api/card/:id/query endpoint the Metabase web UI uses (which accepts
+    a JSON body), the /query/csv EXPORT endpoint requires a
+    FORM-ENCODED body with `parameters` as a JSON-*string* field — a raw
+    `json=` request body here is silently accepted (HTTP 200) but the
+    parameter values are never actually bound, so Metabase's engine falls
+    through to "no value provided" and fails every single call with
+    "Error determining value for parameter ... You'll need to pick a
+    value for 'Start date'". Reproduced directly (same JSON body, both
+    failing identically) and fixed by switching to `data=` (form-encoded)
+    with `parameters` JSON-stringified — confirmed to return real CSV
+    rows. This matches the working pattern already used elsewhere for
+    exactly this reason (a proven production Metabase sync script uses
+    `data={"parameters": json.dumps(parameters), ...}` for this same
+    endpoint, never `json=`).
     """
     headers = metabase_session()
     parameters = [
@@ -315,7 +344,10 @@ def fetch_metabase_csv_range(card_id: int, start_date: str, end_date: str,
 
     csv_resp = requests.post(
         f"{METABASE_URL}/api/card/{card_id}/query/csv",
-        json={"parameters": parameters, "ignore_cache": ignore_cache},
+        data={
+            "parameters": json.dumps(parameters),
+            "ignore_cache": "true" if ignore_cache else "false",
+        },
         headers=headers,
         timeout=180,
     )
