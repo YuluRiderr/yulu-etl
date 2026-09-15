@@ -27,14 +27,48 @@ PATCH NOTE (this version, Octopus Type fix):
   left blank as before, but now prints a warning listing exactly which
   bike_group values were unmapped, so it gets caught in the run log
   instead of silently going blank in the sheet.
+
+PATCH NOTE (this version, Daily Ops Metrics added):
+  New STEP F / process_daily_ops_metrics(): one row per BLR cluster per
+  day in a new 'Daily_Ops_Metrics' tab, combining DAU (Demand Metrics,
+  card 12245), service_swap/Attach fulfillment% + TAT (Token Flow, card
+  11765), mechanic productivity for mechanics >90 days old (Mechanic Flow
+  Testing, card 8966), and enquiry counts/conversion (Token Flow). Unlike
+  every other step in this file (which full-replaces its tab), this one
+  is a RUNNING LOG: delete_rows_for_date_and_append() deletes only
+  yesterday's rows (if a prior run already wrote them) then appends fresh
+  ones, so history accumulates across days instead of being overwritten.
+
+  Two robustness fixes carried over from a proven production Metabase
+  sync script (pm_sync_full.py), applied to the fetch path used by this
+  new step specifically (not touched elsewhere in this file, to avoid
+  changing behaviour of the already-working Sweep/Octopus/Stuck/Warehouse
+  steps):
+    1. ID/text columns (bike/user/token IDs, cluster/city/status names)
+       are forced to string dtype at CSV-parse time via a dtype map, so
+       pandas never round-trips them through float ("5038508.0") the way
+       it silently can when left to infer dtypes.
+    2. Metabase's /api/card/:id/query/csv endpoint can return HTTP 200
+       with a query-execution error (e.g. a missing warehouse table)
+       disguised as the CSV body — confirmed to happen in production.
+       _looks_like_metabase_error_payload() sniffs for this before
+       handing the response to pd.read_csv, which would otherwise parse
+       the JSON error blob as a bogus but valid-looking 0-row DataFrame.
+  Both fetches also retry transient errors (timeouts, dropped
+  connections, 429/500/502/503) with exponential backoff via
+  retry_on_api_error(), same pattern as that reference script.
 """
 
 import io
 import os
+from datetime import datetime, timedelta
+from functools import wraps
+from time import sleep
 
 import pandas as pd
 import requests
 import gspread
+from gspread.exceptions import APIError
 
 # ─────────────────────────────────────────────────────────────
 # CONFIG  (values come from GitHub Secrets / env variables)
@@ -48,11 +82,39 @@ CARD_ID_OCTOPUS   = 7433
 CARD_ID_STUCK     = 9705
 CARD_ID_WAREHOUSE = 6214
 
+# Daily Ops Metrics (STEP F) — reports.yulu.bike/question/<id>-...
+CARD_ID_DEMAND_METRICS = 12245   # demand-metrics-blr (already BLR-scoped)
+CARD_ID_TOKEN_FLOW     = 11765   # token-flow-blr (already BLR-scoped)
+CARD_ID_MECH_FLOW      = 8966    # mechanic-flow-testing (multi-city; filtered to BLR here)
+
 # BLR-only scope
 CITY = "BLR"
 
 MASTER_SHEET_ID       = "1fBjHKwlxRGwjsOSjzHOB6cUjvaKrhvtXdaPGeZjZuH0"
 BROKEN_BIKE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1eGDS2Sj33Gqk63QxmOzw302f05v_WoeSqSZr7Oz2dTE/edit"
+
+DAILY_OPS_SHEET_TAB            = "Daily_Ops_Metrics"
+MECH_PRODUCTIVITY_MIN_DAYS_OLD = 90   # mechanic must be older than this (DOJ) to count
+LIVE_REPAIR_NORMALIZATION      = 3    # 3 live repairs == 1 regular repair, per spec
+BLR_TOTAL_LABEL                = "BLR (Total)"   # synthetic "cluster" row = whole-city rollup
+
+# ID/text-like columns across the three Daily Ops Metrics cards that must
+# never be silently coerced to float by pandas dtype inference (the
+# "5038508.0" class of bug) — forced to string at CSV-parse time instead.
+DAILY_OPS_STR_COLS = {
+    # demand_metrics (card 12245)
+    "cluster_name", "city_code",
+    # token_flow (card 11765)
+    "user_id", "token_id", "token_number", "yc_id", "yc_name", "city",
+    "cluster", "existing_bike_name", "new_bike_name", "existing_bike_group",
+    "new_bike_group", "token_type", "token_type_derived", "token_status",
+    "action_status", "bike_type", "created_by", "fulfilled_by", "closed_by",
+    "updated_by", "user_type",
+    # mechanic_flow (card 8966)
+    "phone_number", "bike_name", "username", "role", "display_name",
+    "sub_role", "start_cluster", "primary_role", "QC pass/fail",
+    "task_status", "task_type",
+}
 
 # "Bikes in Warehouse" card (6214) actually returns these columns.
 # `city` is used only to filter to BLR — it isn't written to the sheet.
@@ -146,6 +208,138 @@ def fetch_metabase_csv(card_id: int, city: str = None) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────
+# METABASE FETCH — robustness helpers for STEP F (Daily Ops Metrics)
+#
+# Scoped to the new fetch path only, so the already-working
+# Sweep/Octopus/Stuck/Warehouse steps above are not touched.
+# ─────────────────────────────────────────────────────────────
+def retry_on_api_error(max_retries=5, initial_delay=2, backoff_factor=2):
+    """
+    Retry decorator for transient errors with exponential backoff — same
+    idea proven out in a production Metabase sync script. Retries dropped
+    connections, timeouts, and 429/500/502/503 from both `requests`
+    (Metabase) and gspread (Google Sheets); anything else propagates
+    immediately.
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            delay = initial_delay
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except requests.exceptions.RequestException as e:
+                    last_exception = e
+                    error_code = e.response.status_code if e.response is not None else None
+                    is_timeout = isinstance(e, requests.exceptions.Timeout)
+                    is_connection_error = isinstance(e, requests.exceptions.ConnectionError)
+                    if (
+                        (error_code in (429, 500, 502, 503) or is_timeout or is_connection_error)
+                        and attempt < max_retries - 1
+                    ):
+                        reason = error_code or ("Timeout" if is_timeout else "ConnectionError")
+                        print(f"  WARNING: {reason} in {func.__name__}, retrying in {delay}s "
+                              f"(attempt {attempt + 1}/{max_retries})")
+                        sleep(delay)
+                        delay *= backoff_factor
+                        continue
+                    raise
+                except APIError as e:
+                    last_exception = e
+                    error_code = None
+                    if hasattr(e, "response") and hasattr(e.response, "status_code"):
+                        error_code = e.response.status_code
+                    if error_code in (429, 500, 502, 503) and attempt < max_retries - 1:
+                        print(f"  WARNING: gspread API error {error_code} in {func.__name__}, "
+                              f"retrying in {delay}s (attempt {attempt + 1}/{max_retries})")
+                        sleep(delay)
+                        delay *= backoff_factor
+                        continue
+                    raise
+            raise last_exception
+        return wrapper
+    return decorator
+
+
+class MetabaseQueryError(RuntimeError):
+    """
+    Raised when Metabase's /api/card/:id/query/csv endpoint returns HTTP
+    200 claiming CSV, but the body is actually a query-execution error
+    (e.g. a missing/renamed warehouse table) disguised as data — confirmed
+    to happen in production. Deliberately not retried: retrying a broken
+    query doesn't fix it, so this should abort STEP F for this run rather
+    than silently writing 0s/blanks as if the underlying data were empty.
+    """
+
+
+def _looks_like_metabase_error_payload(text: str) -> bool:
+    """
+    pd.read_csv on a JSON error blob doesn't raise -- it silently parses
+    the braces/commas as one meaningless header line with 0 data rows,
+    which is indistinguishable from genuine emptiness unless sniffed for
+    first.
+    """
+    stripped = text.lstrip()
+    if not stripped.startswith("{"):
+        return False
+    head = stripped[:2000]
+    return '"status":"failed"' in head or '"error_type":' in head or (
+        '"error":' in head and '"started_at":' in head
+    )
+
+
+def get_yesterday() -> str:
+    return (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+@retry_on_api_error(max_retries=5, initial_delay=2, backoff_factor=2)
+def fetch_metabase_csv_range(card_id: int, start_date: str, end_date: str,
+                              force_str_cols: set = None, ignore_cache: bool = True) -> pd.DataFrame:
+    """
+    Like fetch_metabase_csv(), but for cards parameterised by a
+    {{start_date}}/{{end_date}} date range (Demand Metrics, Token Flow,
+    Mechanic Flow Testing) instead of a {{City}} tag, with the two fixes
+    described in the module docstring: force_str_cols keeps ID/text
+    columns as strings at parse time (never float-coerced), and the
+    response is checked for a disguised Metabase query-execution error
+    before being handed to pd.read_csv. ignore_cache defaults to True
+    since STEP F always asks for a specific already-closed day — a stale
+    cached answer for that day is never desirable here.
+    """
+    headers = metabase_session()
+    parameters = [
+        {"type": "date/single", "value": start_date, "target": ["variable", ["template-tag", "start_date"]]},
+        {"type": "date/single", "value": end_date,   "target": ["variable", ["template-tag", "end_date"]]},
+    ]
+
+    csv_resp = requests.post(
+        f"{METABASE_URL}/api/card/{card_id}/query/csv",
+        json={"parameters": parameters, "ignore_cache": ignore_cache},
+        headers=headers,
+        timeout=180,
+    )
+    csv_resp.raise_for_status()
+
+    if _looks_like_metabase_error_payload(csv_resp.text):
+        raise MetabaseQueryError(
+            f"[card_{card_id}] Metabase returned HTTP 200 claiming CSV, but the "
+            f"body is a query-execution error payload, not real data. First "
+            f"800 chars: {csv_resp.text[:800]}"
+        )
+
+    peek = pd.read_csv(io.StringIO(csv_resp.text), nrows=0)
+    peek.columns = [c.strip() for c in peek.columns]
+    dtype_map = {c: str for c in peek.columns if force_str_cols and c in force_str_cols}
+
+    df = pd.read_csv(io.StringIO(csv_resp.text), dtype=dtype_map or None, low_memory=False)
+    df.columns = [c.strip() for c in df.columns]
+
+    print(f"  [Card {card_id}] {start_date} -> {end_date} | {len(df)} rows | cols: {df.columns.tolist()}")
+    return df
+
+
+# ─────────────────────────────────────────────────────────────
 # SHEET HELPER
 # ─────────────────────────────────────────────────────────────
 def col_letter(n: int) -> str:
@@ -179,6 +373,58 @@ def clear_and_upload(gc: gspread.Client, sheet_id: str, tab: str, df: pd.DataFra
             value_input_option="user_entered",
         )
     print(f"  '{tab}' → {len(df)} rows uploaded.")
+
+
+@retry_on_api_error(max_retries=5, initial_delay=2, backoff_factor=2)
+def delete_rows_for_date_and_append(gc: gspread.Client, sheet_id: str, tab: str,
+                                     df: pd.DataFrame, date_col_letter: str, target_date: str):
+    """
+    Running-log write helper for STEP F (Daily Ops Metrics), mirroring the
+    delete-for-date-then-append pattern used for daily Metabase syncs
+    elsewhere: deletes any existing rows in `tab` whose `date_col_letter`
+    column equals `target_date` (a plain 'YYYY-MM-DD' string match, since
+    dates are written here as plain strings via user_entered — not
+    serials), then appends `df`'s rows for that date at the bottom.
+    Unlike clear_and_upload(), this never touches rows for any other
+    date, so the tab accumulates history across days instead of being
+    overwritten on every run.
+    """
+    ws = gc.open_by_key(sheet_id).worksheet(tab)
+    col_idx = letter_to_index(date_col_letter)
+    date_vals = ws.col_values(col_idx)
+
+    rows_to_delete = [
+        i + 1 for i, val in enumerate(date_vals)
+        if i > 0 and str(val).strip() == target_date
+    ]
+
+    if rows_to_delete:
+        groups = []
+        start = end = rows_to_delete[0]
+        for row in rows_to_delete[1:]:
+            if row == end + 1:
+                end = row
+            else:
+                groups.append((start, end))
+                start = end = row
+        groups.append((start, end))
+
+        delete_requests = {
+            "requests": [
+                {"deleteDimension": {"range": {
+                    "sheetId": ws.id, "dimension": "ROWS",
+                    "startIndex": s - 1, "endIndex": e,
+                }}}
+                for s, e in reversed(groups)
+            ]
+        }
+        gc.open_by_key(sheet_id).batch_update(delete_requests)
+        print(f"  '{tab}' → deleted {len(rows_to_delete)} existing row(s) for {target_date}.")
+
+    values = clean_for_sheets(df)
+    if values:
+        ws.append_rows(values, value_input_option="user_entered")
+    print(f"  '{tab}' → appended {len(values)} row(s) for {target_date}.")
 
 
 def update_named_columns(gc: gspread.Client, sheet_id: str, tab: str,
@@ -673,6 +919,233 @@ def process_warehouse(gc: gspread.Client) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────
+# STEP F — DAILY OPS METRICS
+#   Demand Metrics (12245) + Token Flow (11765) + Mechanic Flow Testing (8966)
+# ─────────────────────────────────────────────────────────────
+def _token_fulfillment_metrics(token_df: pd.DataFrame, type_value: str,
+                                col_prefix: str) -> pd.DataFrame:
+    """
+    Per-cluster fulfillment% (user-level and token-level) + mean TAT for
+    one token_type_derived value (e.g. "service_swap" or "Attach").
+
+      token-level fulfillment% = closed tokens / total tokens of that type
+      user-level fulfillment%  = unique users with >=1 closed token of
+                                  that type / unique users with >=1 token
+                                  of that type at all
+      TAT                      = mean checkin_to_fulfilled_tat_mins over
+                                  CLOSED tokens of that type only
+    """
+    cols = ["cluster",
+            f"{col_prefix}_fulfillment_pct_user",
+            f"{col_prefix}_fulfillment_pct_token",
+            f"{col_prefix}_tat_mins"]
+
+    sub = token_df[token_df["token_type_derived"] == type_value]
+    if sub.empty:
+        return pd.DataFrame(columns=cols)
+
+    closed = sub[sub["token_status"] == "Closed"]
+
+    token_total  = sub.groupby("cluster")["token_id"].nunique().rename("token_total")
+    token_closed = closed.groupby("cluster")["token_id"].nunique().rename("token_closed")
+    user_total   = sub.groupby("cluster")["user_id"].nunique().rename("user_total")
+    user_closed  = closed.groupby("cluster")["user_id"].nunique().rename("user_closed")
+    tat          = closed.groupby("cluster")["checkin_to_fulfilled_tat_mins"].mean().rename("tat_mins")
+
+    out = pd.concat([token_total, token_closed, user_total, user_closed, tat], axis=1)
+    out[["token_total", "token_closed", "user_total", "user_closed"]] = (
+        out[["token_total", "token_closed", "user_total", "user_closed"]].fillna(0)
+    )
+
+    out[f"{col_prefix}_fulfillment_pct_user"] = out.apply(
+        lambda r: round(100 * r["user_closed"] / r["user_total"], 1) if r["user_total"] else None, axis=1)
+    out[f"{col_prefix}_fulfillment_pct_token"] = out.apply(
+        lambda r: round(100 * r["token_closed"] / r["token_total"], 1) if r["token_total"] else None, axis=1)
+    out[f"{col_prefix}_tat_mins"] = out["tat_mins"].round(1)
+
+    return out.reset_index()[cols]
+
+
+def process_daily_ops_metrics(gc: gspread.Client):
+    """
+    New tab 'Daily_Ops_Metrics': one row per BLR cluster for yesterday
+    (the last fully-closed day), combining:
+      - dau                                               (Demand Metrics, 12245)
+      - service_swap fulfillment% (user/token) + TAT      (Token Flow, 11765)
+      - attachment fulfillment% (user/token) + TAT         (Token Flow, 11765)
+      - mechanic productivity, mechanics >90 days old       (Mechanic Flow, 8966)
+      - enquiry_total + enquiry->attachment%                (Token Flow, 11765)
+
+    Mechanic productivity (confirmed logic): for mechanics with
+    primary_role == "Maintenance" and date_of_joining more than
+    MECH_PRODUCTIVITY_MIN_DAYS_OLD days before the report date, in a given
+    cluster: (unique bikes with live_repair_flag==0 and QC pass/fail !=
+    "fail" [blank counts as not-fail]) + (unique bikes with
+    live_repair_flag==1 / LIVE_REPAIR_NORMALIZATION), divided by the
+    unique count of those mechanics. No task_type filter (repair +
+    non-repair tasks both count, per explicit confirmation).
+
+    Enquiry->Attachment%: of users with an Enquiry token in a cluster on
+    the report date, the % who also have an Attach token in that SAME
+    cluster and day (no direct link between the two token types exists in
+    the data, so this is a same-user/same-cluster/same-day proxy).
+
+    BLR total row: every metric also gets a synthetic "BLR (Total)" row —
+    RECOMPUTED across the whole city, not a sum/average of the per-cluster
+    rows (fulfillment%/TAT/productivity don't aggregate linearly — e.g.
+    city-wide fulfillment% is closed÷total across ALL BLR tokens, not the
+    mean of each cluster's %). Implemented by duplicating each city's
+    already-BLR-filtered rows under the label BLR_TOTAL_LABEL before the
+    per-cluster groupby, so the exact same aggregation code produces both
+    the per-cluster rows and the city-total row in one pass.
+
+    Every source is hard-filtered to city == "BLR" before any computation
+    — no other city's rows ever reach a groupby here.
+
+    Written as a running log via delete_rows_for_date_and_append() — see
+    that function's docstring — not a full replace.
+    """
+    print("\n── STEP F: Daily Ops Metrics ──")
+    report_date = get_yesterday()
+    report_dt = datetime.strptime(report_date, "%Y-%m-%d").date()
+
+    # ---- Demand Metrics (base: one row per cluster) ----
+    demand_df = fetch_metabase_csv_range(
+        CARD_ID_DEMAND_METRICS, report_date, report_date, force_str_cols=DAILY_OPS_STR_COLS)
+    demand_df = demand_df[demand_df["city_code"] == CITY].copy()
+    demand_df = demand_df[demand_df["cluster_name"].notna()].copy()
+    demand_df = demand_df.rename(columns={"cluster_name": "cluster"})
+    base = demand_df[["cluster", "dau"]].copy()
+    base = pd.concat(
+        [pd.DataFrame([{"cluster": BLR_TOTAL_LABEL, "dau": base["dau"].sum()}]), base],
+        ignore_index=True,
+    )
+
+    # ---- Token Flow (service_swap / Attach / Enquiry) ----
+    token_df = fetch_metabase_csv_range(
+        CARD_ID_TOKEN_FLOW, report_date, report_date, force_str_cols=DAILY_OPS_STR_COLS)
+    token_df = token_df[token_df["city"] == CITY].copy()
+    # Duplicate every BLR row under BLR_TOTAL_LABEL so the same per-cluster
+    # groupby logic below also produces a genuine whole-city aggregate row.
+    token_df = pd.concat(
+        [token_df, token_df.assign(cluster=BLR_TOTAL_LABEL)], ignore_index=True)
+
+    swap_metrics   = _token_fulfillment_metrics(token_df, "service_swap", "service_swap")
+    attach_metrics = _token_fulfillment_metrics(token_df, "Attach", "attachment")
+
+    enquiry_df = token_df[token_df["token_type_derived"] == "Enquiry"]
+    enquiry_total = enquiry_df.groupby("cluster")["token_id"].nunique().rename("enquiry_total")
+
+    attach_users_by_cluster = (
+        token_df[token_df["token_type_derived"] == "Attach"]
+        .groupby("cluster")["user_id"].apply(set)
+    )
+    enquiry_users_by_cluster = enquiry_df.groupby("cluster")["user_id"].apply(set)
+
+    def _enquiry_to_attach_pct(cluster: str, users: set) -> float | None:
+        if not users:
+            return None
+        attach_users = attach_users_by_cluster.get(cluster, set())
+        return round(100 * len(users & attach_users) / len(users), 1)
+
+    enquiry_pct = pd.Series(
+        {c: _enquiry_to_attach_pct(c, u) for c, u in enquiry_users_by_cluster.items()},
+        name="enquiry_to_attachment_pct",
+    )
+    enquiry_summary = (
+        pd.concat([enquiry_total, enquiry_pct], axis=1)
+        .reset_index().rename(columns={"index": "cluster"})
+    )
+
+    # ---- Mechanic Flow Testing (productivity, mechanics >90 days old) ----
+    mech_df = fetch_metabase_csv_range(
+        CARD_ID_MECH_FLOW, report_date, report_date, force_str_cols=DAILY_OPS_STR_COLS)
+    mech_df = mech_df[mech_df["city"] == CITY].copy()
+
+    mech_df["task_start_dt"]   = pd.to_datetime(mech_df["task_start_dt"], errors="coerce").dt.date
+    mech_df["date_of_joining"] = pd.to_datetime(mech_df["date_of_joining"], errors="coerce").dt.date
+    mech_df = mech_df[mech_df["task_start_dt"] == report_dt].copy()
+    mech_df["bike_name"] = normalise_bike_id(mech_df["bike_name"])
+    mech_df["days_old"] = mech_df["date_of_joining"].map(
+        lambda d: (report_dt - d).days if pd.notna(d) else None)
+
+    # Denominator = ONLY maintenance-profile people: primary_role ==
+    # "Maintenance" (the mechanic's actual HR role, not the task's own
+    # "role" column, which is always "Maintenance" for every row in this
+    # report regardless of who performed it) AND DOJ > 90 days — same
+    # eligibility rule as compute_mechanics_audit() in the reference sync
+    # script. mechanic_count below is the unique count of exactly this
+    # population; it is never task/row counts.
+    eligible = mech_df[
+        (mech_df["primary_role"] == "Maintenance")
+        & mech_df["days_old"].notna()
+        & (mech_df["days_old"] > MECH_PRODUCTIVITY_MIN_DAYS_OLD)
+    ].copy()
+
+    if eligible.empty:
+        print(f"  WARNING: no eligible mechanics (Maintenance, DOJ > "
+              f"{MECH_PRODUCTIVITY_MIN_DAYS_OLD}d) found for {report_date} — "
+              f"mechanic_productivity_90d will be 0 for every cluster.")
+        productivity = pd.DataFrame(columns=["cluster", "mechanic_productivity_90d"])
+    else:
+        eligible["qc_norm"] = eligible["QC pass/fail"].fillna("").astype(str).str.strip().str.lower()
+        eligible["live_repair_flag"] = pd.to_numeric(
+            eligible["live_repair_flag"], errors="coerce").fillna(0).astype(int)
+
+        # Duplicate under BLR_TOTAL_LABEL so the city-total productivity is
+        # (all BLR regular bikes + all BLR live bikes/3) / all eligible BLR
+        # mechanics — not an average of the per-cluster ratios. Done AFTER
+        # qc_norm/live_repair_flag are derived, so both copies carry them.
+        eligible = pd.concat(
+            [eligible, eligible.assign(start_cluster=BLR_TOTAL_LABEL)], ignore_index=True)
+
+        not_failed   = eligible["qc_norm"] != "fail"
+        regular_mask = not_failed & (eligible["live_repair_flag"] == 0)
+        live_mask    = not_failed & (eligible["live_repair_flag"] == 1)
+
+        mechanic_counts = eligible.groupby("start_cluster")["user_id"].nunique().rename("mechanic_count")
+        regular_counts  = eligible[regular_mask].groupby("start_cluster")["bike_name"].nunique().rename("regular_bikes")
+        live_counts     = eligible[live_mask].groupby("start_cluster")["bike_name"].nunique().rename("live_bikes")
+
+        productivity = pd.concat([mechanic_counts, regular_counts, live_counts], axis=1).fillna(0)
+        productivity["mechanic_productivity_90d"] = productivity.apply(
+            lambda r: round(
+                (r["regular_bikes"] + r["live_bikes"] / LIVE_REPAIR_NORMALIZATION) / r["mechanic_count"], 3
+            ) if r["mechanic_count"] else None,
+            axis=1,
+        )
+        productivity = productivity.reset_index().rename(
+            columns={"start_cluster": "cluster"})[["cluster", "mechanic_productivity_90d"]]
+
+    # ---- Merge everything onto the Demand Metrics cluster list ----
+    result = base.merge(swap_metrics, on="cluster", how="left")
+    result = result.merge(attach_metrics, on="cluster", how="left")
+    result = result.merge(productivity, on="cluster", how="left")
+    result = result.merge(enquiry_summary, on="cluster", how="left")
+
+    # No eligible mechanics (Maintenance, DOJ > 90d) for a cluster that day
+    # reads as 0 productivity, not blank — confirmed explicitly.
+    result["mechanic_productivity_90d"] = result["mechanic_productivity_90d"].fillna(0)
+
+    result.insert(1, "date", report_date)
+
+    COLS_ORDER = [
+        "cluster", "date", "dau",
+        "service_swap_fulfillment_pct_user", "service_swap_fulfillment_pct_token", "service_swap_tat_mins",
+        "attachment_fulfillment_pct_user", "attachment_fulfillment_pct_token", "attachment_tat_mins",
+        "mechanic_productivity_90d",
+        "enquiry_total", "enquiry_to_attachment_pct",
+    ]
+    result = result[COLS_ORDER]
+
+    delete_rows_for_date_and_append(
+        gc, MASTER_SHEET_ID, DAILY_OPS_SHEET_TAB, result,
+        date_col_letter="B", target_date=report_date,
+    )
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────
 def main():
@@ -684,6 +1157,14 @@ def main():
     df_final, df2 = process_stuck(gc, sweep_df)
     process_parts_summary(gc, df_final, df2)
     process_warehouse(gc)
+
+    try:
+        process_daily_ops_metrics(gc)
+    except Exception as e:
+        # Non-blocking: a failure here (e.g. MetabaseQueryError, a missing
+        # column on a report that changed shape) should never take down
+        # the rest of the ETL run above it.
+        print(f"  WARNING: Daily Ops Metrics step failed, skipping: {e}")
 
     print("\n✅ ETL complete.")
 
