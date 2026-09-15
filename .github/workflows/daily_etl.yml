@@ -14,6 +14,11 @@ on:
         description: "Optional: end date for the backfill (YYYY-MM-DD). Defaults to yesterday."
         required: false
         default: ""
+      daily_ops_backfill_overwrite:
+        description: "Overwrite mode: delete + recompute EVERY date in range (not just missing ones) — use after a fix to the per-date math itself so already-backfilled history picks it up"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   run-etl:
@@ -55,13 +60,17 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           BACKFILL_START: ${{ github.event.inputs.daily_ops_backfill_start }}
           BACKFILL_END: ${{ github.event.inputs.daily_ops_backfill_end }}
+          BACKFILL_OVERWRITE: ${{ github.event.inputs.daily_ops_backfill_overwrite }}
         run: |
           if [ -n "$BACKFILL_START" ]; then
+            ARGS=(--daily-ops-backfill-start "$BACKFILL_START")
             if [ -n "$BACKFILL_END" ]; then
-              python etl_yulu.py --daily-ops-backfill-start "$BACKFILL_START" --daily-ops-backfill-end "$BACKFILL_END"
-            else
-              python etl_yulu.py --daily-ops-backfill-start "$BACKFILL_START"
+              ARGS+=(--daily-ops-backfill-end "$BACKFILL_END")
             fi
+            if [ "$BACKFILL_OVERWRITE" = "true" ]; then
+              ARGS+=(--daily-ops-backfill-overwrite)
+            fi
+            python etl_yulu.py "${ARGS[@]}"
           else
             python etl_yulu.py
           fi
