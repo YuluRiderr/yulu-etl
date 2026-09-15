@@ -1485,18 +1485,28 @@ def compute_daily_ops_metrics_range(start_date: str, end_date: str) -> dict[str,
     return results
 
 
-def refresh_daily_ops_metrics_range(gc: gspread.Client, start_date: str, end_date: str) -> None:
+def refresh_daily_ops_metrics_range(gc: gspread.Client, start_date: str, end_date: str,
+                                     overwrite: bool = False) -> None:
     """
-    Backfills 'Daily_Ops_Metrics' for every date in [start_date, end_date]
-    that isn't already in the sheet. Unlike the daily run (which
-    delete-then-appends exactly one day, so it can safely re-run today's
-    row), this is a fill-the-gaps job: existing dates are read once up
-    front and skipped, and every new date's rows are appended in ONE
-    batch write at the end — appropriate for a wide historical range
-    where a per-date Sheets round-trip would be far slower than the
-    Metabase fetch itself.
+    Backfills 'Daily_Ops_Metrics' for [start_date, end_date]. Unlike the
+    daily run (which delete-then-appends exactly one day, so it can safely
+    re-run today's row), this is normally a fill-the-gaps job: existing
+    dates are read once up front and skipped, and every new date's rows
+    are appended in ONE batch write at the end — appropriate for a wide
+    historical range where a per-date Sheets round-trip would be far
+    slower than the Metabase fetch itself.
+
+    overwrite=True switches this to a full recompute: every existing row
+    whose date falls in [start_date, end_date] is deleted first (whatever
+    it currently says), then the ENTIRE range is recomputed fresh and
+    appended — not just the gaps. Use this after a correctness fix to the
+    per-date math itself (e.g. a metric's date-bucketing changed) so
+    already-backfilled history actually picks up the fix, since the
+    default fill-the-gaps mode would otherwise skip every date that's
+    already present and leave its old, wrong values untouched forever.
     """
-    print(f"\n── Daily Ops Metrics BACKFILL: {start_date} -> {end_date} ──")
+    print(f"\n── Daily Ops Metrics BACKFILL: {start_date} -> {end_date} "
+          f"({'OVERWRITE' if overwrite else 'fill gaps'}) ──")
 
     ss = gc.open_by_key(MASTER_SHEET_ID)
     try:
@@ -1516,10 +1526,43 @@ def refresh_daily_ops_metrics_range(gc: gspread.Client, start_date: str, end_dat
         all_possible_dates.append(cur.isoformat())
         cur += timedelta(days=1)
 
-    existing_dates = {
-        d for d in all_possible_dates if any(_matches_target_date(v, d) for v in raw_date_vals)
-    } if raw_date_vals else set()
-    print(f"  '{DAILY_OPS_SHEET_TAB}' already has {len(existing_dates)} date(s) in range — those will be skipped.")
+    if overwrite and raw_date_vals:
+        col_idx = letter_to_index("B")
+        date_vals = ws.col_values(col_idx)
+        rows_to_delete = [
+            i + 1 for i, val in enumerate(date_vals)
+            if i > 0 and any(_matches_target_date(val, d) for d in all_possible_dates)
+        ]
+        if rows_to_delete:
+            groups = []
+            s = e = rows_to_delete[0]
+            for r in rows_to_delete[1:]:
+                if r == e + 1:
+                    e = r
+                else:
+                    groups.append((s, e))
+                    s = e = r
+            groups.append((s, e))
+            delete_requests = {
+                "requests": [
+                    {"deleteDimension": {"range": {
+                        "sheetId": ws.id, "dimension": "ROWS",
+                        "startIndex": s - 1, "endIndex": e,
+                    }}}
+                    for s, e in reversed(groups)
+                ]
+            }
+            ss.batch_update(delete_requests)
+            print(f"  Overwrite mode: deleted {len(rows_to_delete)} existing row(s) in range "
+                  f"before recomputing — every date will be rewritten fresh.")
+        existing_dates = set()
+    elif overwrite:
+        existing_dates = set()
+    else:
+        existing_dates = {
+            d for d in all_possible_dates if any(_matches_target_date(v, d) for v in raw_date_vals)
+        } if raw_date_vals else set()
+        print(f"  '{DAILY_OPS_SHEET_TAB}' already has {len(existing_dates)} date(s) in range — those will be skipped.")
 
     results = compute_daily_ops_metrics_range(start_date, end_date)
 
@@ -1558,6 +1601,18 @@ def main():
         default=None,
         help="End date (YYYY-MM-DD) for --daily-ops-backfill-start. Defaults to yesterday.",
     )
+    parser.add_argument(
+        "--daily-ops-backfill-overwrite",
+        action="store_true",
+        help=(
+            "With --daily-ops-backfill-start: delete and recompute EVERY "
+            "date in range, not just the ones missing from the sheet. Use "
+            "after a fix to the per-date math itself (e.g. a metric's date "
+            "column changed) so already-backfilled history actually picks "
+            "up the fix — the default fill-the-gaps mode would otherwise "
+            "skip every date already present and leave its old values."
+        ),
+    )
     args = parser.parse_args()
 
     print("Authenticating with Google Sheets…")
@@ -1565,7 +1620,10 @@ def main():
 
     if args.daily_ops_backfill_start:
         end_date = args.daily_ops_backfill_end or get_yesterday()
-        refresh_daily_ops_metrics_range(gc, args.daily_ops_backfill_start, end_date)
+        refresh_daily_ops_metrics_range(
+            gc, args.daily_ops_backfill_start, end_date,
+            overwrite=args.daily_ops_backfill_overwrite,
+        )
         print("\n✅ Daily Ops Metrics backfill complete.")
         return
 
