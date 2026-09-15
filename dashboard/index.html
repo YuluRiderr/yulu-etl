@@ -7,6 +7,7 @@
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🛵</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@700;800&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.1/chart.umd.min.js"></script>
 <style>
   :root {
     --bg: #F3F6F1;
@@ -16,6 +17,7 @@
     --text: #101712;
     --text-dim: #55625A;
     --accent: #6E8F00;
+    --accent2: #2E6F95;
     --accent-ink: #FFFFFF;
     --good: #1D8F52;
     --warn: #A5670A;
@@ -28,7 +30,7 @@
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
       --bg: #0B1210; --surface: #121B18; --surface-2: #182420; --border: #253530;
-      --text: #ECF2EF; --text-dim: #93A69C; --accent: #C6FF3D; --accent-ink: #0B1210;
+      --text: #ECF2EF; --text-dim: #93A69C; --accent: #C6FF3D; --accent2: #6FC8FF; --accent-ink: #0B1210;
       --good: #46E195; --warn: #FFC24B; --bad: #FF6B70;
       --stripe-good: #46E195; --stripe-warn: #FFC24B; --stripe-bad: #FF6B70;
       --shadow: 0 1px 2px rgba(0,0,0,.4), 0 12px 32px rgba(0,0,0,.45);
@@ -36,50 +38,66 @@
   }
   :root[data-theme="dark"] {
     --bg: #0B1210; --surface: #121B18; --surface-2: #182420; --border: #253530;
-    --text: #ECF2EF; --text-dim: #93A69C; --accent: #C6FF3D; --accent-ink: #0B1210;
+    --text: #ECF2EF; --text-dim: #93A69C; --accent: #C6FF3D; --accent2: #6FC8FF; --accent-ink: #0B1210;
     --good: #46E195; --warn: #FFC24B; --bad: #FF6B70;
     --stripe-good: #46E195; --stripe-warn: #FFC24B; --stripe-bad: #FF6B70;
     --shadow: 0 1px 2px rgba(0,0,0,.4), 0 12px 32px rgba(0,0,0,.45);
   }
 
   * { box-sizing: border-box; }
-  html, body { height: 100%; margin: 0; }
+  html { scroll-behavior: smooth; }
   body {
-    background: var(--bg); color: var(--text);
+    margin: 0; background: var(--bg); color: var(--text);
     font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
-    overflow: hidden;
   }
   .num { font-family: "IBM Plex Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
   .disp { font-family: "Big Shoulders Display", "Arial Narrow", sans-serif; font-weight: 800; text-transform: uppercase; letter-spacing: .01em; text-wrap: balance; }
 
-  #frame { display: flex; flex-direction: column; height: 100dvh; }
-
-  header { display: flex; align-items: center; justify-content: space-between; padding: 0 22px; height: 58px; flex: none; border-bottom: 1px solid var(--border); background: var(--surface); }
+  header { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; justify-content: space-between; padding: 0 22px; height: 58px; border-bottom: 1px solid var(--border); background: var(--surface); flex-wrap: wrap; gap: 8px; }
   .brand { display: flex; align-items: baseline; gap: 10px; }
   .brand .mark { font-family: "Big Shoulders Display", sans-serif; font-weight: 800; font-size: 22px; letter-spacing: .02em; }
   .brand .mark span { color: var(--accent); }
   .brand .sub { font-size: 12px; color: var(--text-dim); letter-spacing: .06em; text-transform: uppercase; }
+  .head-right { display: flex; align-items: center; gap: 10px; }
   .asof { display: flex; align-items: center; gap: 8px; background: var(--surface-2); border: 1px solid var(--border); padding: 7px 14px; border-radius: 8px; font-size: 13px; }
+  .refresh-pill { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--text-dim); }
+  .refresh-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--good); animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  @media (prefers-reduced-motion: reduce) { .refresh-dot { animation: none; } }
 
-  #stage { flex: 1; min-height: 0; padding: 34px 48px 10px; overflow: hidden; display: flex; flex-direction: column; }
-  .slide { flex: 1; min-height: 0; display: flex; flex-direction: column; animation: rise .38s ease both; }
-  @media (prefers-reduced-motion: reduce) { .slide { animation: none; } }
-  @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+  nav.jump { position: sticky; top: 58px; z-index: 9; display: flex; gap: 4px; padding: 10px 22px; background: var(--bg); border-bottom: 1px solid var(--border); overflow-x: auto; }
+  nav.jump a { flex: none; font-size: 12.5px; color: var(--text-dim); text-decoration: none; padding: 6px 12px; border-radius: 999px; border: 1px solid transparent; white-space: nowrap; }
+  nav.jump a:hover { color: var(--text); border-color: var(--border); background: var(--surface); }
 
+  main { max-width: 1180px; margin: 0 auto; padding: 28px 22px 60px; }
+  section { margin-bottom: 44px; scroll-margin-top: 112px; }
   .eyebrow { font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--text-dim); margin-bottom: 6px; }
-  .title { font-size: 40px; line-height: 1; margin: 0 0 4px; }
-  .deck-desc { color: var(--text-dim); font-size: 14.5px; max-width: 66ch; margin: 0 0 20px; }
+  .title { font-size: 32px; line-height: 1; margin: 0 0 4px; }
+  .deck-desc { color: var(--text-dim); font-size: 14.5px; max-width: 70ch; margin: 0 0 18px; }
 
-  .kpi-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; }
+  .kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; }
   .kpi { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px 18px 16px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 6px; min-width: 0; }
   .kpi .label { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .07em; }
-  .kpi .value { font-size: 34px; font-weight: 700; line-height: 1; }
-  .kpi .value .unit { font-size: 16px; color: var(--text-dim); margin-left: 3px; font-weight: 500; }
-  .kpi .foot { font-size: 12px; color: var(--text-dim); }
+  .kpi .value { font-size: 30px; font-weight: 700; line-height: 1; }
+  .kpi .value .unit { font-size: 15px; color: var(--text-dim); margin-left: 3px; font-weight: 500; }
+  .kpi .foot { font-size: 12px; color: var(--text-dim); display: flex; gap: 10px; flex-wrap: wrap; }
+  .kpi .foot b { color: var(--text); font-weight: 600; }
+  .kpi .foot .dot2 { color: var(--accent2); }
 
   .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px 22px; box-shadow: var(--shadow); }
   .panel + .panel { margin-top: 14px; }
   .panel h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-dim); margin: 0 0 14px; font-weight: 600; }
+
+  .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+  select.cluster-pick { font-family: inherit; font-size: 13px; padding: 7px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); }
+
+  .chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+  .chart-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; box-shadow: var(--shadow); }
+  .chart-card h4 { margin: 0 0 2px; font-size: 13.5px; font-weight: 600; }
+  .chart-card .legend { display: flex; gap: 14px; font-size: 11.5px; color: var(--text-dim); margin-bottom: 8px; }
+  .chart-card .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .chart-card .legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+  .chart-card .box { position: relative; height: 170px; }
 
   .bar-row { display: flex; align-items: center; gap: 10px; padding: 5px 0; }
   .bar-row .lab { width: 130px; flex: none; font-size: 12.5px; color: var(--text-dim); text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -112,38 +130,32 @@
   .all-clear { color: var(--good); font-size: 15px; font-weight: 600; padding: 20px 0; }
   .empty-note { color: var(--text-dim); font-size: 13.5px; padding: 20px 0; }
 
-  footer { flex: none; height: 60px; display: flex; align-items: center; justify-content: center; gap: 22px; border-top: 1px solid var(--border); background: var(--surface); }
-  .nav-btn { width: 34px; height: 34px; border-radius: 50%; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 16px; }
-  .nav-btn:hover { border-color: var(--accent); color: var(--accent); }
-  .nav-btn:disabled { opacity: .3; cursor: default; }
-  .nav-btn:disabled:hover { border-color: var(--border); color: var(--text); }
-  .dots { display: flex; gap: 8px; }
-  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--border); cursor: pointer; border: none; padding: 0; }
-  .dot.on { background: var(--accent); width: 20px; border-radius: 4px; }
-  .slide-name { font-size: 12px; color: var(--text-dim); width: 190px; }
-  .slide-name.right { text-align: right; }
+  footer { text-align: center; padding: 20px; font-size: 12px; color: var(--text-dim); }
 </style>
 </head>
 <body>
-<div id="frame">
   <header>
     <div class="brand">
       <span class="mark">YULU<span>·</span>BLR</span>
       <span class="sub">Daily Ops Review</span>
     </div>
-    <div class="asof">📅 <span class="num" id="asOfLabel">—</span></div>
+    <div class="head-right">
+      <span class="refresh-pill"><span class="refresh-dot"></span>auto-refreshes every 15 min</span>
+      <div class="asof">📅 <span class="num" id="asOfLabel">—</span></div>
+    </div>
   </header>
 
-  <div id="stage"></div>
+  <nav class="jump">
+    <a href="#overview">Overview</a>
+    <a href="#trends">Trends</a>
+    <a href="#compare">Period Comparison</a>
+    <a href="#clusters">By Cluster</a>
+    <a href="#attention">Needs Attention</a>
+  </nav>
 
-  <footer>
-    <span class="slide-name" id="prevName"></span>
-    <button class="nav-btn" id="prevBtn" onclick="go(-1)">‹</button>
-    <div class="dots" id="dots"></div>
-    <button class="nav-btn" id="nextBtn" onclick="go(1)">›</button>
-    <span class="slide-name right" id="nextName"></span>
-  </footer>
-</div>
+  <main id="app"></main>
+
+  <footer>Built from Daily_Ops_Metrics · rebuilds automatically after every ETL run</footer>
 
 <script src="data.js"></script>
 <script src="app.js"></script>

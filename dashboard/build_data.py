@@ -1,15 +1,20 @@
 """
 Builds data.js — a static snapshot of the 'Daily_Ops_Metrics' tab (written
-daily by etl_yulu.py's STEP F), pre-aggregated into period-comparison KPIs
-per cluster and metric:
+daily by etl_yulu.py's STEP F), pre-aggregated two ways:
 
-    latest   yesterday only (the most recent date captured)
-    p0_7     trailing 7 days before yesterday (days 1-7 back)
-    p7_14    the 7 days before that (days 8-14 back)
-    p14_35   the 3 weeks before that (days 15-35 back)
+  1. Period comparison per cluster and metric:
+       latest   yesterday only (the most recent date captured)
+       p0_7     trailing 7 days before yesterday (days 1-7 back)
+       p7_14    the 7 days before that (days 8-14 back)
+       p14_35   the 3 weeks before that (days 15-35 back)
 
-Run headless by .github/workflows/deploy-dashboard.yml — on push and on a
-daily schedule shortly after refresh.yml's ETL run. Not interactive.
+  2. A daily time series (last SERIES_DAYS calendar days) per cluster and
+     metric, for trend charts -- one shared "dates" axis plus a value
+     array per (cluster, metric), null for any date with no row.
+
+Run headless by .github/workflows/deploy-dashboard.yml — on push, on a
+daily schedule, and right after refresh.yml's ETL workflow completes (see
+that workflow's `workflow_run` trigger). Not interactive.
 
 Reuses the exact same Google auth pattern and secret name
 (GOOGLE_SERVICE_ACCOUNT_JSON) as etl_yulu.py, and the same MASTER_SHEET_ID
@@ -46,6 +51,11 @@ PERIODS = [
     ("p14_35", 15, 35),
 ]
 
+# How many trailing calendar days of daily-level detail to ship for trend
+# charts. Independent of PERIODS above (which only needs 35 days) -- kept
+# a little longer so a "last 60 days" trend line has room to breathe.
+SERIES_DAYS = 60
+
 
 def get_gspread_client() -> gspread.Client:
     sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -72,20 +82,7 @@ def to_float(v):
         return None
 
 
-def aggregate(records: list[dict]) -> dict:
-    dates = sorted({r["date"] for r in records if r.get("date")})
-    if not dates:
-        return {"anchor_date": None, "days_captured": 0, "clusters": {}}
-
-    anchor = date.fromisoformat(dates[-1])
-
-    by_cluster_date: dict[str, dict[str, dict]] = {}
-    for r in records:
-        d, c = r.get("date"), r.get("cluster")
-        if not d or not c:
-            continue
-        by_cluster_date.setdefault(c, {})[d] = r
-
+def build_period_comparison(by_cluster_date: dict, anchor: date) -> dict:
     clusters_out = {}
     for cluster, date_map in by_cluster_date.items():
         metrics_out = {}
@@ -109,11 +106,50 @@ def aggregate(records: list[dict]) -> dict:
                     periods_out[label] = round(sum(vals) / len(vals), 2)
             metrics_out[metric] = periods_out
         clusters_out[cluster] = metrics_out
+    return clusters_out
+
+
+def build_series(by_cluster_date: dict, anchor: date) -> tuple[list[str], dict]:
+    series_dates = [
+        (anchor - timedelta(days=offset)).isoformat()
+        for offset in range(SERIES_DAYS - 1, -1, -1)
+    ]
+    series_out = {}
+    for cluster, date_map in by_cluster_date.items():
+        metric_series = {}
+        for metric in METRICS:
+            values = []
+            for d in series_dates:
+                row = date_map.get(d)
+                values.append(to_float(row.get(metric)) if row else None)
+            metric_series[metric] = values
+        series_out[cluster] = metric_series
+    return series_dates, series_out
+
+
+def aggregate(records: list[dict]) -> dict:
+    dates = sorted({r["date"] for r in records if r.get("date")})
+    if not dates:
+        return {"anchor_date": None, "days_captured": 0, "clusters": {}, "dates": [], "series": {}}
+
+    anchor = date.fromisoformat(dates[-1])
+
+    by_cluster_date: dict[str, dict[str, dict]] = {}
+    for r in records:
+        d, c = r.get("date"), r.get("cluster")
+        if not d or not c:
+            continue
+        by_cluster_date.setdefault(c, {})[d] = r
+
+    clusters_out = build_period_comparison(by_cluster_date, anchor)
+    series_dates, series_out = build_series(by_cluster_date, anchor)
 
     return {
         "anchor_date": dates[-1],
         "days_captured": len(dates),
         "clusters": clusters_out,
+        "dates": series_dates,
+        "series": series_out,
     }
 
 
@@ -134,7 +170,8 @@ def main():
     print(
         f"Wrote data.js — anchor_date={result.get('anchor_date')}, "
         f"days_captured={result.get('days_captured')}, "
-        f"{len(result.get('clusters', {}))} cluster(s)."
+        f"{len(result.get('clusters', {}))} cluster(s), "
+        f"{len(result.get('dates', []))} series date(s)."
     )
 
 
