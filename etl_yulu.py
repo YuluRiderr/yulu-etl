@@ -57,8 +57,43 @@ PATCH NOTE (this version, Daily Ops Metrics added):
   Both fetches also retry transient errors (timeouts, dropped
   connections, 429/500/502/503) with exponential backoff via
   retry_on_api_error(), same pattern as that reference script.
+
+PATCH NOTE (this version, Daily Ops Metrics backfill folded in):
+  The standalone backfill_daily_ops_metrics.py script (and its own
+  dedicated GitHub Actions workflow) is retired — this file now does both
+  jobs, triggered by an optional CLI flag, so there is exactly one script
+  and one workflow to maintain instead of two that could drift apart.
+
+  compute_daily_ops_metrics_range()/refresh_daily_ops_metrics_range() are
+  new: they fill in a whole [start_date, end_date] range of Daily_Ops_Metrics
+  history in one run, fetching each of the 3 cards ONCE for the whole
+  range instead of once per day. The per-date math itself
+  (_compute_daily_ops_rows_for_date) is now a single shared function used
+  by BOTH the daily run (process_daily_ops_metrics, one real Metabase call
+  per card scoped to exactly yesterday) and the backfill (one bulk fetch,
+  sliced locally per date) — previously this logic was duplicated
+  practically verbatim between this file and the standalone backfill
+  script, which is exactly the kind of drift risk folding them together
+  removes.
+
+  CHUNKING/CACHING: per explicit instruction, this copies the SAME
+  calendar-month chunking + on-disk cache model already proven out for
+  Mechanics>60 Audit / Cluster KPI in the reference sync script
+  (pm_sync_full.py) — _month_windows()/_is_month_closed(), one gzipped CSV
+  cache file per (source, YYYY-MM), a CLOSED month (fully ended before the
+  current calendar month) served from disk with zero Metabase calls on
+  every future run, the current/open month always fetched fresh
+  (ignore_cache=True). This replaces the standalone backfill script's own
+  fixed 21-day chunk scheme, which used a different, ad hoc model.
+
+  Run it via: `python etl_yulu.py --daily-ops-backfill-start 2026-01-01`
+  (optionally `--daily-ops-backfill-end YYYY-MM-DD`, defaults to
+  yesterday) — this runs ONLY the backfill and skips Sweep/Octopus/Stuck/
+  Warehouse/the daily STEP F entirely. With no flags, behavior is
+  unchanged from before (the normal daily run for yesterday).
 """
 
+import argparse
 import io
 import json
 import os
@@ -98,6 +133,19 @@ DAILY_OPS_SHEET_TAB            = "Daily_Ops_Metrics"
 MECH_PRODUCTIVITY_MIN_DAYS_OLD = 90   # mechanic must be older than this (DOJ) to count
 LIVE_REPAIR_NORMALIZATION      = 3    # 3 live repairs == 1 regular repair, per spec
 BLR_TOTAL_LABEL                = "BLR (Total)"   # synthetic "cluster" row = whole-city rollup
+
+DAILY_OPS_COLS_ORDER = [
+    "cluster", "date", "dau",
+    "service_swap_fulfillment_pct_user", "service_swap_fulfillment_pct_token", "service_swap_tat_mins",
+    "attachment_fulfillment_pct_user", "attachment_fulfillment_pct_token", "attachment_tat_mins",
+    "mechanic_productivity_90d",
+    "enquiry_total", "enquiry_to_attachment_pct",
+]
+
+# On-disk cache for CLOSED calendar months only -- same model/naming
+# convention as the reference sync script's MECHANICS_AUDIT_CACHE_DIR /
+# CLUSTER_KPI_CACHE_DIR. One gzipped CSV per (source_label, "YYYY-MM").
+DAILY_OPS_CACHE_DIR = os.environ.get("DAILY_OPS_CACHE_DIR", ".cache/daily_ops_months")
 
 # ID/text-like columns across the three Daily Ops Metrics cards that must
 # never be silently coerced to float by pandas dtype inference (the
@@ -1056,10 +1104,17 @@ def _token_fulfillment_metrics(token_df: pd.DataFrame, type_value: str,
     return out.reset_index()[cols]
 
 
-def process_daily_ops_metrics(gc: gspread.Client):
+def _compute_daily_ops_rows_for_date(demand_day: pd.DataFrame, token_day: pd.DataFrame,
+                                      mech_day: pd.DataFrame, report_date: str) -> pd.DataFrame:
     """
-    New tab 'Daily_Ops_Metrics': one row per BLR cluster for yesterday
-    (the last fully-closed day), combining:
+    Pure per-date computation, shared by BOTH the daily STEP F run
+    (process_daily_ops_metrics — each input already scoped to exactly one
+    day by its own single-day Metabase fetch) and the range backfill
+    (compute_daily_ops_metrics_range — each input is a date-filtered slice
+    of one bulk multi-month fetch). Identical math either way; only where
+    the per-day data comes from differs.
+
+    One row per BLR cluster for `report_date`, combining:
       - dau                                               (Demand Metrics, 12245)
       - service_swap fulfillment% (user/token) + TAT      (Token Flow, 11765)
       - attachment fulfillment% (user/token) + TAT         (Token Flow, 11765)
@@ -1089,36 +1144,19 @@ def process_daily_ops_metrics(gc: gspread.Client):
     per-cluster groupby, so the exact same aggregation code produces both
     the per-cluster rows and the city-total row in one pass.
 
-    Every source is hard-filtered to city == "BLR" before any computation
-    — no other city's rows ever reach a groupby here.
-
-    Written as a running log via delete_rows_for_date_and_append() — see
-    that function's docstring — not a full replace.
+    Every input is assumed already hard-filtered to city == "BLR" by the
+    caller — no other city's rows should ever reach this function.
     """
-    print("\n── STEP F: Daily Ops Metrics ──")
-    report_date = get_yesterday()
-    report_dt = datetime.strptime(report_date, "%Y-%m-%d").date()
-
-    # ---- Demand Metrics (base: one row per cluster) ----
-    demand_df = fetch_metabase_csv_range(
-        CARD_ID_DEMAND_METRICS, report_date, report_date, force_str_cols=DAILY_OPS_STR_COLS)
-    demand_df = demand_df[demand_df["city_code"] == CITY].copy()
-    demand_df = demand_df[demand_df["cluster_name"].notna()].copy()
-    demand_df = demand_df.rename(columns={"cluster_name": "cluster"})
-    base = demand_df[["cluster", "dau"]].copy()
+    base = demand_day[["cluster", "dau"]].copy()
     base = pd.concat(
         [pd.DataFrame([{"cluster": BLR_TOTAL_LABEL, "dau": base["dau"].sum()}]), base],
         ignore_index=True,
     )
 
-    # ---- Token Flow (service_swap / Attach / Enquiry) ----
-    token_df = fetch_metabase_csv_range(
-        CARD_ID_TOKEN_FLOW, report_date, report_date, force_str_cols=DAILY_OPS_STR_COLS)
-    token_df = token_df[token_df["city"] == CITY].copy()
     # Duplicate every BLR row under BLR_TOTAL_LABEL so the same per-cluster
     # groupby logic below also produces a genuine whole-city aggregate row.
     token_df = pd.concat(
-        [token_df, token_df.assign(cluster=BLR_TOTAL_LABEL)], ignore_index=True)
+        [token_day, token_day.assign(cluster=BLR_TOTAL_LABEL)], ignore_index=True)
 
     swap_metrics   = _token_fulfillment_metrics(token_df, "service_swap", "service_swap")
     attach_metrics = _token_fulfillment_metrics(token_df, "Attach", "attachment")
@@ -1147,18 +1185,6 @@ def process_daily_ops_metrics(gc: gspread.Client):
         .reset_index().rename(columns={"index": "cluster"})
     )
 
-    # ---- Mechanic Flow Testing (productivity, mechanics >90 days old) ----
-    mech_df = fetch_metabase_csv_range(
-        CARD_ID_MECH_FLOW, report_date, report_date, force_str_cols=DAILY_OPS_STR_COLS)
-    mech_df = mech_df[mech_df["city"] == CITY].copy()
-
-    mech_df["task_start_dt"]   = pd.to_datetime(mech_df["task_start_dt"], errors="coerce").dt.date
-    mech_df["date_of_joining"] = pd.to_datetime(mech_df["date_of_joining"], errors="coerce").dt.date
-    mech_df = mech_df[mech_df["task_start_dt"] == report_dt].copy()
-    mech_df["bike_name"] = normalise_bike_id(mech_df["bike_name"])
-    mech_df["days_old"] = mech_df["date_of_joining"].map(
-        lambda d: (report_dt - d).days if pd.notna(d) else None)
-
     # Denominator = ONLY maintenance-profile people: primary_role ==
     # "Maintenance" (the mechanic's actual HR role, not the task's own
     # "role" column, which is always "Maintenance" for every row in this
@@ -1166,10 +1192,10 @@ def process_daily_ops_metrics(gc: gspread.Client):
     # eligibility rule as compute_mechanics_audit() in the reference sync
     # script. mechanic_count below is the unique count of exactly this
     # population; it is never task/row counts.
-    eligible = mech_df[
-        (mech_df["primary_role"] == "Maintenance")
-        & mech_df["days_old"].notna()
-        & (mech_df["days_old"] > MECH_PRODUCTIVITY_MIN_DAYS_OLD)
+    eligible = mech_day[
+        (mech_day["primary_role"] == "Maintenance")
+        & mech_day["days_old"].notna()
+        & (mech_day["days_old"] > MECH_PRODUCTIVITY_MIN_DAYS_OLD)
     ].copy()
 
     if eligible.empty:
@@ -1218,29 +1244,319 @@ def process_daily_ops_metrics(gc: gspread.Client):
     result["mechanic_productivity_90d"] = result["mechanic_productivity_90d"].fillna(0)
 
     result.insert(1, "date", report_date)
+    return result[DAILY_OPS_COLS_ORDER]
 
-    COLS_ORDER = [
-        "cluster", "date", "dau",
-        "service_swap_fulfillment_pct_user", "service_swap_fulfillment_pct_token", "service_swap_tat_mins",
-        "attachment_fulfillment_pct_user", "attachment_fulfillment_pct_token", "attachment_tat_mins",
-        "mechanic_productivity_90d",
-        "enquiry_total", "enquiry_to_attachment_pct",
-    ]
-    result = result[COLS_ORDER]
+
+def process_daily_ops_metrics(gc: gspread.Client):
+    """
+    New tab 'Daily_Ops_Metrics': one row per BLR cluster for yesterday
+    (the last fully-closed day) — see _compute_daily_ops_rows_for_date()
+    for the full metric definitions/math, which this just feeds with a
+    single day's worth of data from 3 fresh, single-day Metabase fetches.
+
+    Every source is hard-filtered to city == "BLR" before any computation
+    — no other city's rows ever reach a groupby here.
+
+    Written as a running log via delete_rows_for_date_and_append() — see
+    that function's docstring — not a full replace.
+    """
+    print("\n── STEP F: Daily Ops Metrics ──")
+    report_date = get_yesterday()
+    report_dt = datetime.strptime(report_date, "%Y-%m-%d").date()
+
+    demand_df = fetch_metabase_csv_range(
+        CARD_ID_DEMAND_METRICS, report_date, report_date, force_str_cols=DAILY_OPS_STR_COLS)
+    demand_df = demand_df[demand_df["city_code"] == CITY].copy()
+    demand_df = demand_df[demand_df["cluster_name"].notna()].copy()
+    demand_df = demand_df.rename(columns={"cluster_name": "cluster"})
+
+    token_df = fetch_metabase_csv_range(
+        CARD_ID_TOKEN_FLOW, report_date, report_date, force_str_cols=DAILY_OPS_STR_COLS)
+    token_df = token_df[token_df["city"] == CITY].copy()
+
+    mech_df = fetch_metabase_csv_range(
+        CARD_ID_MECH_FLOW, report_date, report_date, force_str_cols=DAILY_OPS_STR_COLS)
+    mech_df = mech_df[mech_df["city"] == CITY].copy()
+    mech_df["task_start_dt"]   = pd.to_datetime(mech_df["task_start_dt"], errors="coerce").dt.date
+    mech_df["date_of_joining"] = pd.to_datetime(mech_df["date_of_joining"], errors="coerce").dt.date
+    mech_df = mech_df[mech_df["task_start_dt"] == report_dt].copy()
+    mech_df["bike_name"] = normalise_bike_id(mech_df["bike_name"])
+    mech_df["days_old"] = mech_df["date_of_joining"].map(
+        lambda d: (report_dt - d).days if pd.notna(d) else None)
+
+    result = _compute_daily_ops_rows_for_date(demand_df, token_df, mech_df, report_date)
 
     delete_rows_for_date_and_append(
         gc, MASTER_SHEET_ID, DAILY_OPS_SHEET_TAB, result,
-        date_col_letter="B", target_date=report_date, header=COLS_ORDER,
+        date_col_letter="B", target_date=report_date, header=DAILY_OPS_COLS_ORDER,
     )
     return result
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP F (BACKFILL) — same 3 cards, whole date range in one run
+#
+# Copies the exact calendar-month chunking + on-disk cache model already
+# proven out for Mechanics>60 Audit / Cluster KPI in the reference sync
+# script (pm_sync_full.py): _month_windows()/_is_month_closed(), one
+# gzipped CSV cache file per (source, "YYYY-MM"), a CLOSED month served
+# from disk with zero Metabase calls on every future run, the current/
+# open month always fetched fresh.
+# ─────────────────────────────────────────────────────────────
+def _month_windows(start_date: str, end_date: str) -> list[tuple[str, str]]:
+    """Split [start_date, end_date] into calendar-month windows."""
+    start = datetime.strptime(start_date, "%Y-%m-%d").date()
+    end = datetime.strptime(end_date, "%Y-%m-%d").date()
+    if start > end:
+        return []
+    windows = []
+    cur = start
+    while cur <= end:
+        if cur.month == 12:
+            next_month_start = cur.replace(year=cur.year + 1, month=1, day=1)
+        else:
+            next_month_start = cur.replace(month=cur.month + 1, day=1)
+        window_end = min(end, next_month_start - timedelta(days=1))
+        windows.append((cur.strftime("%Y-%m-%d"), window_end.strftime("%Y-%m-%d")))
+        cur = next_month_start
+    return windows
+
+
+def _is_month_closed(window_start: str, as_of_date: str) -> bool:
+    """A month is "closed" (safe to cache forever) if it's not the same
+    calendar month as_of_date itself falls in."""
+    start = datetime.strptime(window_start, "%Y-%m-%d").date()
+    as_of = datetime.strptime(as_of_date, "%Y-%m-%d").date()
+    return (start.year, start.month) != (as_of.year, as_of.month)
+
+
+def _daily_ops_month_cache_path(source_label: str, window_start: str) -> str:
+    y_m = window_start[:7]  # "YYYY-MM"
+    return os.path.join(DAILY_OPS_CACHE_DIR, f"{source_label}_{y_m}.csv.gz")
+
+
+def _load_daily_ops_month_cache(source_label: str, window_start: str, force_str_cols: set):
+    path = _daily_ops_month_cache_path(source_label, window_start)
+    if not os.path.exists(path):
+        return None
+    try:
+        peek = pd.read_csv(path, compression="gzip", nrows=0)
+        dtype_map = {c: str for c in peek.columns if force_str_cols and c in force_str_cols}
+        df = pd.read_csv(path, compression="gzip", dtype=dtype_map or None, low_memory=False)
+        print(f"  [DailyOps/Cache] HIT {source_label} {window_start[:7]} ({len(df):,} rows) — no Metabase call.")
+        return df
+    except Exception as e:
+        print(f"  [DailyOps/Cache] {source_label} {window_start[:7]} cache file unreadable ({e}) — refetching.")
+        return None
+
+
+def _save_daily_ops_month_cache(source_label: str, window_start: str, df: pd.DataFrame) -> None:
+    if df.empty:
+        # Never cache an empty result -- could be a genuine gap or a
+        # transient Metabase hiccup; retried fresh next run either way.
+        print(f"  [DailyOps/Cache] NOT caching {source_label} {window_start[:7]} "
+              f"(0 rows) — retried fresh next run.")
+        return
+    path = _daily_ops_month_cache_path(source_label, window_start)
+    try:
+        os.makedirs(DAILY_OPS_CACHE_DIR, exist_ok=True)
+        df.to_csv(path, index=False, compression="gzip")
+        print(f"  [DailyOps/Cache] Cached {source_label} {window_start[:7]} ({len(df):,} rows) -> {path}")
+    except Exception as e:
+        print(f"  [DailyOps/Cache] Failed to cache {source_label} {window_start[:7]} ({e}) — will refetch next run.")
+
+
+def _fetch_daily_ops_source_range(card_id: int, source_label: str, start_date: str, end_date: str,
+                                   force_str_cols: set) -> pd.DataFrame:
+    """
+    Fetch one Daily Ops Metrics card for [start_date, end_date] in
+    CALENDAR-MONTH chunks, caching CLOSED months to disk under
+    DAILY_OPS_CACHE_DIR — no Metabase call at all for a month that's
+    already cached from a prior run. The current/open month is always
+    fetched fresh (ignore_cache=True — it's still accumulating today's
+    rows, so a cached answer would be stale by definition).
+    """
+    frames = []
+    cache_hits = cache_misses = 0
+    for window_start, window_end in _month_windows(start_date, end_date):
+        closed = _is_month_closed(window_start, end_date)
+
+        cached_df = _load_daily_ops_month_cache(source_label, window_start, force_str_cols) if closed else None
+        if cached_df is not None:
+            frames.append(cached_df)
+            cache_hits += 1
+            continue
+
+        print(f"  [DailyOps] Fetching {source_label} {window_start} -> {window_end}"
+              f"{' (closed month, will cache)' if closed else ' (open month, never cached)'}...")
+        df = fetch_metabase_csv_range(
+            card_id, window_start, window_end, force_str_cols=force_str_cols, ignore_cache=True)
+        if closed:
+            _save_daily_ops_month_cache(source_label, window_start, df)
+        cache_misses += 1
+        if not df.empty:
+            frames.append(df)
+
+    print(f"  [DailyOps] {source_label} month cache summary: {cache_hits} hit(s), {cache_misses} fetched.")
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+# Columns _compute_daily_ops_rows_for_date() needs present (even if empty)
+# on the token/mechanic per-day slices, so a range with zero rows for a
+# whole source doesn't KeyError on a column that would normally come from
+# a non-empty Metabase CSV export.
+_TOKEN_DAY_EMPTY_COLS = ["cluster", "token_id", "user_id", "token_type_derived",
+                          "token_status", "checkin_to_fulfilled_tat_mins"]
+_MECH_DAY_EMPTY_COLS = ["primary_role", "days_old", "QC pass/fail",
+                         "live_repair_flag", "user_id", "bike_name", "start_cluster"]
+
+
+def compute_daily_ops_metrics_range(start_date: str, end_date: str) -> dict[str, pd.DataFrame]:
+    """
+    Computes Daily Ops Metrics for EVERY date in [start_date, end_date],
+    fetching each of the 3 Metabase cards ONCE for the whole range
+    (month-chunked, closed months cached — see _fetch_daily_ops_source_range),
+    then looping locally per date and calling
+    _compute_daily_ops_rows_for_date() — the exact same math
+    process_daily_ops_metrics() uses for a single day, just fed from a
+    date-filtered slice of the bulk fetch instead of a fresh Metabase call
+    per day. Returns {date: DataFrame} for every date with at least some
+    Demand Metrics data; the caller decides which dates to actually write.
+    """
+    print(f"\n── Daily Ops Metrics backfill: {start_date} -> {end_date} ──")
+
+    demand_all = _fetch_daily_ops_source_range(
+        CARD_ID_DEMAND_METRICS, "demand", start_date, end_date, DAILY_OPS_STR_COLS)
+    if demand_all.empty:
+        print("  WARNING: no Demand Metrics data for the whole range — nothing to compute.")
+        return {}
+    demand_all = demand_all[demand_all["city_code"] == CITY].copy()
+    demand_all = demand_all[demand_all["cluster_name"].notna()].copy()
+    demand_all = demand_all.rename(columns={"cluster_name": "cluster"})
+
+    token_all = _fetch_daily_ops_source_range(
+        CARD_ID_TOKEN_FLOW, "token_flow", start_date, end_date, DAILY_OPS_STR_COLS)
+    token_all = token_all[token_all["city"] == CITY].copy() if not token_all.empty else token_all
+
+    mech_all = _fetch_daily_ops_source_range(
+        CARD_ID_MECH_FLOW, "mech_flow", start_date, end_date, DAILY_OPS_STR_COLS)
+    if not mech_all.empty:
+        mech_all = mech_all[mech_all["city"] == CITY].copy()
+        mech_all["task_start_dt"]   = pd.to_datetime(mech_all["task_start_dt"], errors="coerce").dt.date
+        mech_all["date_of_joining"] = pd.to_datetime(mech_all["date_of_joining"], errors="coerce").dt.date
+        mech_all["bike_name"] = normalise_bike_id(mech_all["bike_name"])
+
+    dates_in_range = sorted(demand_all["date"].dropna().unique().tolist())
+    print(f"  {len(dates_in_range)} date(s) with Demand Metrics data in range.")
+
+    results: dict[str, pd.DataFrame] = {}
+    for d in dates_in_range:
+        demand_day = demand_all[demand_all["date"] == d]
+
+        if token_all.empty:
+            token_day = pd.DataFrame(columns=_TOKEN_DAY_EMPTY_COLS)
+        else:
+            token_day = token_all[token_all["checkin_date"] == d].copy()
+
+        if mech_all.empty:
+            mech_day = pd.DataFrame(columns=_MECH_DAY_EMPTY_COLS)
+        else:
+            report_dt = datetime.strptime(d, "%Y-%m-%d").date()
+            mech_day = mech_all[mech_all["task_start_dt"] == report_dt].copy()
+            mech_day["days_old"] = mech_day["date_of_joining"].map(
+                lambda dd: (report_dt - dd).days if pd.notna(dd) else None)
+
+        day_result = _compute_daily_ops_rows_for_date(demand_day, token_day, mech_day, d)
+        if not day_result.empty:
+            results[d] = day_result
+            print(f"    {d}: {len(day_result)} row(s) computed.")
+
+    return results
+
+
+def refresh_daily_ops_metrics_range(gc: gspread.Client, start_date: str, end_date: str) -> None:
+    """
+    Backfills 'Daily_Ops_Metrics' for every date in [start_date, end_date]
+    that isn't already in the sheet. Unlike the daily run (which
+    delete-then-appends exactly one day, so it can safely re-run today's
+    row), this is a fill-the-gaps job: existing dates are read once up
+    front and skipped, and every new date's rows are appended in ONE
+    batch write at the end — appropriate for a wide historical range
+    where a per-date Sheets round-trip would be far slower than the
+    Metabase fetch itself.
+    """
+    print(f"\n── Daily Ops Metrics BACKFILL: {start_date} -> {end_date} ──")
+
+    ss = gc.open_by_key(MASTER_SHEET_ID)
+    try:
+        ws = ss.worksheet(DAILY_OPS_SHEET_TAB)
+        raw_date_vals = [v for v in ws.col_values(2)[1:] if v]  # column B = date
+    except gspread.exceptions.WorksheetNotFound:
+        print(f"  '{DAILY_OPS_SHEET_TAB}' does not exist yet — creating it...")
+        ws = ss.add_worksheet(
+            title=DAILY_OPS_SHEET_TAB, rows=1000, cols=max(len(DAILY_OPS_COLS_ORDER) + 2, 10))
+        ws.append_row(DAILY_OPS_COLS_ORDER, value_input_option="RAW")
+        raw_date_vals = []
+
+    all_possible_dates = []
+    cur = datetime.strptime(start_date, "%Y-%m-%d").date()
+    end = datetime.strptime(end_date, "%Y-%m-%d").date()
+    while cur <= end:
+        all_possible_dates.append(cur.isoformat())
+        cur += timedelta(days=1)
+
+    existing_dates = {
+        d for d in all_possible_dates if any(_matches_target_date(v, d) for v in raw_date_vals)
+    } if raw_date_vals else set()
+    print(f"  '{DAILY_OPS_SHEET_TAB}' already has {len(existing_dates)} date(s) in range — those will be skipped.")
+
+    results = compute_daily_ops_metrics_range(start_date, end_date)
+
+    rows_to_write = [df for d, df in sorted(results.items()) if d not in existing_dates]
+    if not rows_to_write:
+        print("  Nothing new to write — every date in range is already in the sheet.")
+        return
+
+    final_df = pd.concat(rows_to_write, ignore_index=True)
+    values = clean_for_sheets(final_df)
+    ws.append_rows(values, value_input_option="user_entered")
+    print(f"  Appended {len(values)} row(s) across {len(rows_to_write)} date(s) to '{DAILY_OPS_SHEET_TAB}'.")
 
 
 # ─────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────
 def main():
+    parser = argparse.ArgumentParser(
+        description="Yulu ETL — Sweep/Octopus/Stuck/Warehouse/Daily Ops Metrics sync."
+    )
+    parser.add_argument(
+        "--daily-ops-backfill-start",
+        default=None,
+        help=(
+            "If set (YYYY-MM-DD), run ONLY a Daily Ops Metrics backfill for "
+            "[start, end] instead of the normal daily ETL — skips Sweep/"
+            "Octopus/Stuck/Parts_Summary/Warehouse and the daily STEP F "
+            "entirely. Fetches each of the 3 cards once for the whole "
+            "range (month-chunked, closed months cached to disk) rather "
+            "than once per day."
+        ),
+    )
+    parser.add_argument(
+        "--daily-ops-backfill-end",
+        default=None,
+        help="End date (YYYY-MM-DD) for --daily-ops-backfill-start. Defaults to yesterday.",
+    )
+    args = parser.parse_args()
+
     print("Authenticating with Google Sheets…")
     gc = get_gspread_client()
+
+    if args.daily_ops_backfill_start:
+        end_date = args.daily_ops_backfill_end or get_yesterday()
+        refresh_daily_ops_metrics_range(gc, args.daily_ops_backfill_start, end_date)
+        print("\n✅ Daily Ops Metrics backfill complete.")
+        return
 
     sweep_df      = process_sweep(gc)
     process_octopus(gc)
