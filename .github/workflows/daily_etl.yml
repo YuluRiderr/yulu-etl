@@ -4,12 +4,21 @@ on:
   schedule:
     # 1:00 AM IST = 19:30 UTC (previous day)
     - cron: "30 19 * * *"
-  workflow_dispatch:   # allows manual trigger from GitHub UI
+  workflow_dispatch: # allows manual trigger from GitHub UI
+    inputs:
+      daily_ops_backfill_start:
+        description: "Optional: backfill Daily Ops Metrics from this date (YYYY-MM-DD) instead of the normal daily ETL"
+        required: false
+        default: ""
+      daily_ops_backfill_end:
+        description: "Optional: end date for the backfill (YYYY-MM-DD). Defaults to yesterday."
+        required: false
+        default: ""
 
 jobs:
   run-etl:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 180
 
     steps:
       - name: Checkout repo
@@ -23,10 +32,36 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Same on-disk-cache model as Mechanics>60 Audit / Cluster KPI in the
+      # reference sync script: closed calendar months are cached here so a
+      # Daily Ops Metrics backfill re-run (or one that extends its end
+      # date) never re-fetches a month it already has. Restored/saved
+      # automatically by actions/cache -- no code change needed to benefit
+      # from it. Harmless (and just restores nothing) on a normal daily
+      # run, which never touches this directory.
+      - name: Restore Daily Ops Metrics month cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/daily_ops_months
+          key: daily-ops-months-cache-${{ github.run_id }}
+          restore-keys: |
+            daily-ops-months-cache-
+
       - name: Run ETL
         env:
-          METABASE_URL:                ${{ secrets.METABASE_URL }}
-          METABASE_EMAIL:              ${{ secrets.METABASE_EMAIL }}
-          METABASE_PASSWORD:           ${{ secrets.METABASE_PASSWORD }}
+          METABASE_URL: ${{ secrets.METABASE_URL }}
+          METABASE_EMAIL: ${{ secrets.METABASE_EMAIL }}
+          METABASE_PASSWORD: ${{ secrets.METABASE_PASSWORD }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-        run: python etl_yulu.py
+          BACKFILL_START: ${{ github.event.inputs.daily_ops_backfill_start }}
+          BACKFILL_END: ${{ github.event.inputs.daily_ops_backfill_end }}
+        run: |
+          if [ -n "$BACKFILL_START" ]; then
+            if [ -n "$BACKFILL_END" ]; then
+              python etl_yulu.py --daily-ops-backfill-start "$BACKFILL_START" --daily-ops-backfill-end "$BACKFILL_END"
+            else
+              python etl_yulu.py --daily-ops-backfill-start "$BACKFILL_START"
+            fi
+          else
+            python etl_yulu.py
+          fi
