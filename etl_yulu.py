@@ -1277,9 +1277,16 @@ def process_daily_ops_metrics(gc: gspread.Client):
     mech_df = fetch_metabase_csv_range(
         CARD_ID_MECH_FLOW, report_date, report_date, force_str_cols=DAILY_OPS_STR_COLS)
     mech_df = mech_df[mech_df["city"] == CITY].copy()
-    mech_df["task_start_dt"]   = pd.to_datetime(mech_df["task_start_dt"], errors="coerce").dt.date
+    # day_start_dt (the mechanic's SHIFT day) rather than task_start_dt (the
+    # raw calendar date of the task timestamp) -- confirmed live these can
+    # differ: a task at 05:48 on the 14th can carry day_start_dt=13th when
+    # it belongs to a shift that started the evening of the 13th. Using
+    # task_start_dt would misattribute overnight tasks to the wrong
+    # business day, both for which date's row they land in AND for the
+    # >90-day eligibility check below (which must be "as of" the correct day).
+    mech_df["day_start_dt"]    = pd.to_datetime(mech_df["day_start_dt"], errors="coerce").dt.date
     mech_df["date_of_joining"] = pd.to_datetime(mech_df["date_of_joining"], errors="coerce").dt.date
-    mech_df = mech_df[mech_df["task_start_dt"] == report_dt].copy()
+    mech_df = mech_df[mech_df["day_start_dt"] == report_dt].copy()
     mech_df["bike_name"] = normalise_bike_id(mech_df["bike_name"])
     mech_df["days_old"] = mech_df["date_of_joining"].map(
         lambda d: (report_dt - d).days if pd.notna(d) else None)
@@ -1442,7 +1449,11 @@ def compute_daily_ops_metrics_range(start_date: str, end_date: str) -> dict[str,
         CARD_ID_MECH_FLOW, "mech_flow", start_date, end_date, DAILY_OPS_STR_COLS)
     if not mech_all.empty:
         mech_all = mech_all[mech_all["city"] == CITY].copy()
-        mech_all["task_start_dt"]   = pd.to_datetime(mech_all["task_start_dt"], errors="coerce").dt.date
+        # day_start_dt (shift day), not task_start_dt (raw task timestamp's
+        # calendar date) -- see the identical comment in
+        # process_daily_ops_metrics() for why these can differ and why
+        # day_start_dt is the correct one for date bucketing.
+        mech_all["day_start_dt"]    = pd.to_datetime(mech_all["day_start_dt"], errors="coerce").dt.date
         mech_all["date_of_joining"] = pd.to_datetime(mech_all["date_of_joining"], errors="coerce").dt.date
         mech_all["bike_name"] = normalise_bike_id(mech_all["bike_name"])
 
@@ -1462,7 +1473,7 @@ def compute_daily_ops_metrics_range(start_date: str, end_date: str) -> dict[str,
             mech_day = pd.DataFrame(columns=_MECH_DAY_EMPTY_COLS)
         else:
             report_dt = datetime.strptime(d, "%Y-%m-%d").date()
-            mech_day = mech_all[mech_all["task_start_dt"] == report_dt].copy()
+            mech_day = mech_all[mech_all["day_start_dt"] == report_dt].copy()
             mech_day["days_old"] = mech_day["date_of_joining"].map(
                 lambda dd: (report_dt - dd).days if pd.notna(dd) else None)
 
