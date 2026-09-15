@@ -375,27 +375,71 @@ def clear_and_upload(gc: gspread.Client, sheet_id: str, tab: str, df: pd.DataFra
     print(f"  '{tab}' → {len(df)} rows uploaded.")
 
 
+def _matches_target_date(val, target_date: str) -> bool:
+    """
+    Compares a cell value against target_date ('YYYY-MM-DD') tolerating
+    Google Sheets' own reformatting: writing an ISO date string via
+    value_input_option="user_entered" makes Sheets parse it as a real
+    date and re-render it per the spreadsheet's locale/column format
+    (commonly DD/MM/YYYY for an India-locale sheet) -- a plain string
+    equality check against the original ISO string would then silently
+    never match again, breaking the delete-before-append idempotency on
+    any re-run for the same date (confirmed as a real risk here, not
+    hypothetical -- this file writes dates as plain ISO strings with no
+    explicit @TEXT/plain-text column format forcing them to stay text).
+    """
+    if val is None:
+        return False
+    s = str(val).strip()
+    if not s:
+        return False
+    if s == target_date:
+        return True
+    for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y"):
+        try:
+            if datetime.strptime(s, fmt).strftime("%Y-%m-%d") == target_date:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 @retry_on_api_error(max_retries=5, initial_delay=2, backoff_factor=2)
 def delete_rows_for_date_and_append(gc: gspread.Client, sheet_id: str, tab: str,
-                                     df: pd.DataFrame, date_col_letter: str, target_date: str):
+                                     df: pd.DataFrame, date_col_letter: str, target_date: str,
+                                     header: list[str] | None = None):
     """
     Running-log write helper for STEP F (Daily Ops Metrics), mirroring the
     delete-for-date-then-append pattern used for daily Metabase syncs
     elsewhere: deletes any existing rows in `tab` whose `date_col_letter`
-    column equals `target_date` (a plain 'YYYY-MM-DD' string match, since
-    dates are written here as plain strings via user_entered — not
-    serials), then appends `df`'s rows for that date at the bottom.
-    Unlike clear_and_upload(), this never touches rows for any other
-    date, so the tab accumulates history across days instead of being
-    overwritten on every run.
+    column matches `target_date` (see _matches_target_date -- tolerant of
+    Sheets reformatting a plain ISO string into a locale date), then
+    appends `df`'s rows for that date at the bottom. Unlike
+    clear_and_upload(), this never touches rows for any other date, so
+    the tab accumulates history across days instead of being overwritten
+    on every run.
+
+    If `tab` doesn't exist yet, it's created with `header` as row 1 (or
+    df's own columns if `header` is omitted) -- plain .worksheet(tab)
+    raises WorksheetNotFound on a brand-new tab, which previously meant
+    this step silently failed every run (caught by main()'s non-blocking
+    try/except around STEP F) until someone manually created the tab.
     """
-    ws = gc.open_by_key(sheet_id).worksheet(tab)
+    try:
+        ws = gc.open_by_key(sheet_id).worksheet(tab)
+    except gspread.exceptions.WorksheetNotFound:
+        print(f"  '{tab}' does not exist yet — creating it...")
+        ss = gc.open_by_key(sheet_id)
+        header_row = header if header is not None else list(df.columns)
+        ws = ss.add_worksheet(title=tab, rows=1000, cols=max(len(header_row) + 2, 10))
+        ws.append_row(header_row, value_input_option="RAW")
+
     col_idx = letter_to_index(date_col_letter)
     date_vals = ws.col_values(col_idx)
 
     rows_to_delete = [
         i + 1 for i, val in enumerate(date_vals)
-        if i > 0 and str(val).strip() == target_date
+        if i > 0 and _matches_target_date(val, target_date)
     ]
 
     if rows_to_delete:
@@ -1140,7 +1184,7 @@ def process_daily_ops_metrics(gc: gspread.Client):
 
     delete_rows_for_date_and_append(
         gc, MASTER_SHEET_ID, DAILY_OPS_SHEET_TAB, result,
-        date_col_letter="B", target_date=report_date,
+        date_col_letter="B", target_date=report_date, header=COLS_ORDER,
     )
     return result
 
