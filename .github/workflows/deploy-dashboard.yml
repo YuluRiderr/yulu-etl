@@ -7,11 +7,15 @@ on:
       - "dashboard/**"
       - ".github/workflows/deploy-dashboard.yml"
   schedule:
-    # 20:00 UTC = 1:30 AM IST — 30 min after refresh.yml's 1 AM IST ETL run
-    # (cron "30 19 * * *" UTC), so Daily_Ops_Metrics has today's row before
-    # this builds. Adjust if refresh.yml's schedule ever changes.
+    # Fallback safety net only — the workflow_run trigger below is what
+    # actually keeps the dashboard fresh day to day (rebuilds immediately
+    # after every "Yulu Daily ETL" run, scheduled or manual/backfill).
+    # 20:00 UTC = 1:30 AM IST, in case that trigger is ever missed.
     - cron: "0 20 * * *"
   workflow_dispatch: {}
+  workflow_run:
+    workflows: ["Yulu Daily ETL"]
+    types: [completed]
 
 permissions:
   contents: read
@@ -24,6 +28,11 @@ concurrency:
 
 jobs:
   build-and-deploy:
+    # Only proceed on a workflow_run trigger if the ETL run it followed
+    # actually succeeded -- a failed/cancelled ETL run has nothing new
+    # worth rebuilding the dashboard from. Every other trigger (push,
+    # schedule, manual dispatch) always proceeds.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     environment:
       name: github-pages
