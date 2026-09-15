@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BLR Ops Review</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🛵</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@700;800&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #F3F6F1;
+    --surface: #FFFFFF;
+    --surface-2: #EAEFE6;
+    --border: #D7E0D2;
+    --text: #101712;
+    --text-dim: #55625A;
+    --accent: #6E8F00;
+    --accent-ink: #FFFFFF;
+    --good: #1D8F52;
+    --warn: #A5670A;
+    --bad: #C93A3E;
+    --stripe-good: #1D8F52;
+    --stripe-warn: #C99A0A;
+    --stripe-bad: #C93A3E;
+    --shadow: 0 1px 2px rgba(16,23,18,.06), 0 8px 24px rgba(16,23,18,.06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0B1210; --surface: #121B18; --surface-2: #182420; --border: #253530;
+      --text: #ECF2EF; --text-dim: #93A69C; --accent: #C6FF3D; --accent-ink: #0B1210;
+      --good: #46E195; --warn: #FFC24B; --bad: #FF6B70;
+      --stripe-good: #46E195; --stripe-warn: #FFC24B; --stripe-bad: #FF6B70;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 12px 32px rgba(0,0,0,.45);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0B1210; --surface: #121B18; --surface-2: #182420; --border: #253530;
+    --text: #ECF2EF; --text-dim: #93A69C; --accent: #C6FF3D; --accent-ink: #0B1210;
+    --good: #46E195; --warn: #FFC24B; --bad: #FF6B70;
+    --stripe-good: #46E195; --stripe-warn: #FFC24B; --stripe-bad: #FF6B70;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 12px 32px rgba(0,0,0,.45);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+    overflow: hidden;
+  }
+  .num { font-family: "IBM Plex Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  .disp { font-family: "Big Shoulders Display", "Arial Narrow", sans-serif; font-weight: 800; text-transform: uppercase; letter-spacing: .01em; text-wrap: balance; }
+
+  #frame { display: flex; flex-direction: column; height: 100dvh; }
+
+  header { display: flex; align-items: center; justify-content: space-between; padding: 0 22px; height: 58px; flex: none; border-bottom: 1px solid var(--border); background: var(--surface); }
+  .brand { display: flex; align-items: baseline; gap: 10px; }
+  .brand .mark { font-family: "Big Shoulders Display", sans-serif; font-weight: 800; font-size: 22px; letter-spacing: .02em; }
+  .brand .mark span { color: var(--accent); }
+  .brand .sub { font-size: 12px; color: var(--text-dim); letter-spacing: .06em; text-transform: uppercase; }
+  .asof { display: flex; align-items: center; gap: 8px; background: var(--surface-2); border: 1px solid var(--border); padding: 7px 14px; border-radius: 8px; font-size: 13px; }
+
+  #stage { flex: 1; min-height: 0; padding: 34px 48px 10px; overflow: hidden; display: flex; flex-direction: column; }
+  .slide { flex: 1; min-height: 0; display: flex; flex-direction: column; animation: rise .38s ease both; }
+  @media (prefers-reduced-motion: reduce) { .slide { animation: none; } }
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+
+  .eyebrow { font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--text-dim); margin-bottom: 6px; }
+  .title { font-size: 40px; line-height: 1; margin: 0 0 4px; }
+  .deck-desc { color: var(--text-dim); font-size: 14.5px; max-width: 66ch; margin: 0 0 20px; }
+
+  .kpi-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; }
+  .kpi { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px 18px 16px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  .kpi .label { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .07em; }
+  .kpi .value { font-size: 34px; font-weight: 700; line-height: 1; }
+  .kpi .value .unit { font-size: 16px; color: var(--text-dim); margin-left: 3px; font-weight: 500; }
+  .kpi .foot { font-size: 12px; color: var(--text-dim); }
+
+  .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px 22px; box-shadow: var(--shadow); }
+  .panel + .panel { margin-top: 14px; }
+  .panel h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-dim); margin: 0 0 14px; font-weight: 600; }
+
+  .bar-row { display: flex; align-items: center; gap: 10px; padding: 5px 0; }
+  .bar-row .lab { width: 130px; flex: none; font-size: 12.5px; color: var(--text-dim); text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .bar-row .track { flex: 1; height: 14px; background: var(--surface-2); border-radius: 4px; position: relative; overflow: hidden; }
+  .bar-row .fill { position: absolute; inset: 0 auto 0 0; border-radius: 4px; background: var(--accent); }
+  .bar-row .val { width: 60px; flex: none; font-size: 12.5px; text-align: right; }
+
+  .tabs { display: flex; gap: 6px; margin-bottom: 16px; flex-wrap: wrap; }
+  .tab { padding: 7px 14px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text-dim); font-size: 13px; cursor: pointer; font-family: inherit; }
+  .tab.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+
+  table.ptable { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  table.ptable th, table.ptable td { padding: 9px 12px; text-align: right; border-bottom: 1px solid var(--border); }
+  table.ptable th:first-child, table.ptable td:first-child { text-align: left; }
+  table.ptable thead th { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-dim); font-weight: 600; }
+  table.ptable tbody tr.total td { font-weight: 700; background: var(--surface-2); }
+  table.ptable td.dash { color: var(--text-dim); }
+  table.ptable td .delta { font-size: 11.5px; margin-left: 6px; }
+  .delta.up { color: var(--good); } .delta.down { color: var(--bad); }
+
+  .flag-list { display: flex; flex-direction: column; gap: 10px; }
+  .flag { display: flex; align-items: center; gap: 14px; background: var(--surface-2); border-radius: 10px; padding: 12px 16px; border-left: 4px solid var(--stripe-warn); }
+  .flag.bad { border-left-color: var(--stripe-bad); }
+  .flag .fmeta { flex: 1; min-width: 0; }
+  .flag .fcluster { font-weight: 700; font-size: 14.5px; }
+  .flag .fdetail { font-size: 12.5px; color: var(--text-dim); margin-top: 2px; }
+  .flag .fdelta { font-family: "IBM Plex Mono", monospace; font-size: 15px; font-weight: 600; }
+  .flag.bad .fdelta { color: var(--bad); }
+  .flag:not(.bad) .fdelta { color: var(--warn); }
+  .all-clear { color: var(--good); font-size: 15px; font-weight: 600; padding: 20px 0; }
+  .empty-note { color: var(--text-dim); font-size: 13.5px; padding: 20px 0; }
+
+  footer { flex: none; height: 60px; display: flex; align-items: center; justify-content: center; gap: 22px; border-top: 1px solid var(--border); background: var(--surface); }
+  .nav-btn { width: 34px; height: 34px; border-radius: 50%; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 16px; }
+  .nav-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .nav-btn:disabled { opacity: .3; cursor: default; }
+  .nav-btn:disabled:hover { border-color: var(--border); color: var(--text); }
+  .dots { display: flex; gap: 8px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--border); cursor: pointer; border: none; padding: 0; }
+  .dot.on { background: var(--accent); width: 20px; border-radius: 4px; }
+  .slide-name { font-size: 12px; color: var(--text-dim); width: 190px; }
+  .slide-name.right { text-align: right; }
+</style>
+</head>
+<body>
+<div id="frame">
+  <header>
+    <div class="brand">
+      <span class="mark">YULU<span>·</span>BLR</span>
+      <span class="sub">Daily Ops Review</span>
+    </div>
+    <div class="asof">📅 <span class="num" id="asOfLabel">—</span></div>
+  </header>
+
+  <div id="stage"></div>
+
+  <footer>
+    <span class="slide-name" id="prevName"></span>
+    <button class="nav-btn" id="prevBtn" onclick="go(-1)">‹</button>
+    <div class="dots" id="dots"></div>
+    <button class="nav-btn" id="nextBtn" onclick="go(1)">›</button>
+    <span class="slide-name right" id="nextName"></span>
+  </footer>
+</div>
+
+<script src="data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
