@@ -22,7 +22,7 @@ const METRIC_TABS = [
   { key: "attachment_fulfillment_pct_user", label: "Attach Fulfillment (User)", fmt: v => v.toFixed(1), unit: "%" },
   { key: "attachment_fulfillment_pct_token", label: "Attach Fulfillment (Token)", fmt: v => v.toFixed(1), unit: "%" },
   { key: "mechanic_productivity_90d", label: "Mech. Productivity", fmt: v => v.toFixed(2), unit: "" },
-  { key: "enquiry_total", label: "Enquiries", fmt: v => Math.round(v).toLocaleString("en-IN"), unit: "" },
+  { key: "enquiry_total", label: "Enquiries (avg/day)", fmt: v => v.toFixed(1), unit: "" },
   { key: "enquiry_to_attachment_pct", label: "Enquiry Conversion", fmt: v => v.toFixed(1), unit: "%" },
 ];
 

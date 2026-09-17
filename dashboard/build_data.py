@@ -40,9 +40,12 @@ METRICS = [
     "mechanic_productivity_90d",
     "enquiry_total", "enquiry_to_attachment_pct",
 ]
-# enquiry_total is a per-day count -> summed over a period; every other
-# metric is a per-day rate/average -> averaged over a period.
-SUM_METRICS = {"enquiry_total"}
+# Every metric, including enquiry_total, is AVERAGED per day over a
+# period -- not summed. A summed window total isn't comparable against a
+# single day's value (e.g. a 21-day sum vs. "Latest Day" always reads as
+# a huge, meaningless drop), so every period column stays in "typical
+# per-day" units the same way DAU/fulfillment%/productivity already are.
+SUM_METRICS: set[str] = set()
 
 PERIODS = [
     ("latest", 0, 0),
