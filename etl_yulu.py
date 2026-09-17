@@ -1600,30 +1600,33 @@ def refresh_daily_ops_metrics_range(gc: gspread.Client, start_date: str, end_dat
 # ─────────────────────────────────────────────────────────────
 # STEP G — CLUSTER UTILIZATION SNAPSHOT
 #
-# A separate spreadsheet ("R&M New Working Sheet", NOT the same file
-# MASTER_SHEET_ID points at) has a live, formula-driven "Utilization%" tab
-# -- one row per cluster, recalculating continuously against whatever the
-# underlying raw data currently says. It carries no history of its own:
-# whatever it says right now is all that's ever visible, with nothing
-# showing what it said yesterday or last week.
+# The 'Utilization' tab (in the SAME spreadsheet as MASTER_SHEET_ID --
+# originally lived in a separate "R&M New Working Sheet" spreadsheet as
+# "Utilization%", which the service account had no access to; moved into
+# this spreadsheet and renamed specifically so this step doesn't need a
+# second spreadsheet share at all) is live and formula-driven -- one row
+# per cluster, recalculating continuously against whatever the underlying
+# raw data currently says. It carries no history of its own: whatever it
+# says right now is all that's ever visible, with nothing showing what it
+# said yesterday or last week.
 #
 # This step snapshots that tab once a day and appends it, dated, to a new
-# 'Cluster_Utilization_Log' tab in the MAIN Yulu ETL spreadsheet
-# (MASTER_SHEET_ID) -- turning an always-live-only view into an actual
-# time series the dashboard can chart. Written as a running log via
-# delete_rows_for_date_and_append(), same pattern as Daily Ops Metrics, so
-# re-running the same day is idempotent.
+# 'Cluster_Utilization_Log' tab in the same spreadsheet -- turning an
+# always-live-only view into an actual time series the dashboard can
+# chart. Written as a running log via delete_rows_for_date_and_append(),
+# same pattern as Daily Ops Metrics, so re-running the same day is
+# idempotent.
 #
 # CAVEAT, unlike every Metabase-backed step above: there is no way to ask
 # this sheet what it looked like on a past date -- it only ever has
 # "right now". History starts accumulating from whichever day this step
 # first runs; it can never be backfilled retroactively for earlier dates.
 # ─────────────────────────────────────────────────────────────
-CLUSTER_UTIL_SPREADSHEET_ID = "1fuCo3fSY0KoW6Y2UQSgtGOBiVIocD_iFEyLdAlOMAr0"
-CLUSTER_UTIL_SOURCE_TAB     = "Utilization%"
+CLUSTER_UTIL_SPREADSHEET_ID = MASTER_SHEET_ID
+CLUSTER_UTIL_SOURCE_TAB     = "Utilization"
 CLUSTER_UTIL_LOG_TAB        = "Cluster_Utilization_Log"
 
-# Column order exactly as they appear left-to-right in 'Utilization%'
+# Column order exactly as they appear left-to-right in 'Utilization'
 # B2:L2's header row (confirmed live). "Actual live/DAU" and "Util %" are
 # percentage-formatted cells -- Sheets stores/returns those as plain
 # fractions (e.g. 0.72), so both are scaled by 100 below to land as plain
@@ -1677,7 +1680,7 @@ def process_cluster_utilization_snapshot(gc: gspread.Client):
     result = _parse_cluster_util_rows(raw_rows, today)
 
     if result.empty:
-        print("  WARNING: no rows found in 'Utilization%' B3:L200 — skipping snapshot.")
+        print("  WARNING: no rows found in 'Utilization' B3:L200 — skipping snapshot.")
         return result
 
     delete_rows_for_date_and_append(
