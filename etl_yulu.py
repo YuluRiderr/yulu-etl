@@ -215,6 +215,26 @@ def get_gspread_client() -> gspread.Client:
     return gspread.service_account(filename="service_account.json")
 
 
+def get_service_account_email() -> str | None:
+    """
+    Reads client_email straight out of the credentials JSON itself, rather
+    than relying on gspread.Client exposing it somewhere convenient
+    (confirmed live: gc.auth.service_account_email doesn't exist on the
+    gspread.Client returned by gspread.service_account() in the version
+    this runs on — that lookup silently failed under a bare try/except and
+    printed nothing at all, which is what prompted switching to this
+    instead). Not a secret -- an identifier, safe to log every run.
+    """
+    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    try:
+        if sa_json:
+            return json.loads(sa_json).get("client_email")
+        with open("service_account.json", encoding="utf-8") as f:
+            return json.load(f).get("client_email")
+    except Exception:
+        return None
+
+
 # ─────────────────────────────────────────────────────────────
 # METABASE FETCH
 # ─────────────────────────────────────────────────────────────
@@ -1724,15 +1744,12 @@ def main():
 
     print("Authenticating with Google Sheets…")
     gc = get_gspread_client()
-    try:
-        # Not a secret -- an identifier, like a username. Logged every run
-        # so that "which spreadsheets need this shared with them" is
-        # always answerable straight from the run log, instead of having
-        # to dig a service account email out of a credentials file no one
-        # has open at debugging time.
-        print(f"  Service account: {gc.auth.service_account_email}")
-    except Exception:
-        pass
+    # Not a secret -- an identifier, like a username. Logged every run so
+    # that "which spreadsheets need this shared with it" is always
+    # answerable straight from the run log, instead of digging a service
+    # account email out of a credentials file no one has open at
+    # debugging time.
+    print(f"  Service account: {get_service_account_email()}")
 
     if args.daily_ops_backfill_start:
         end_date = args.daily_ops_backfill_end or get_yesterday()
