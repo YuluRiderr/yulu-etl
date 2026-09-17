@@ -51,11 +51,12 @@ PERIODS = [
     ("latest", 0, 0),
     ("p0_7", 1, 7),
     ("p7_14", 8, 14),
-    ("p14_35", 15, 35),
+    ("p14_21", 15, 21),
+    ("p21_28", 22, 28),
 ]
 
 # How many trailing calendar days of daily-level detail to ship for trend
-# charts. Independent of PERIODS above (which only needs 35 days) -- kept
+# charts. Independent of PERIODS above (which only needs 28 days) -- kept
 # a little longer so a "last 60 days" trend line has room to breathe.
 SERIES_DAYS = 60
 
