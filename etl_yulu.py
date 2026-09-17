@@ -1578,6 +1578,96 @@ def refresh_daily_ops_metrics_range(gc: gspread.Client, start_date: str, end_dat
 
 
 # ─────────────────────────────────────────────────────────────
+# STEP G — CLUSTER UTILIZATION SNAPSHOT
+#
+# A separate spreadsheet ("R&M New Working Sheet", NOT the same file
+# MASTER_SHEET_ID points at) has a live, formula-driven "Utilization%" tab
+# -- one row per cluster, recalculating continuously against whatever the
+# underlying raw data currently says. It carries no history of its own:
+# whatever it says right now is all that's ever visible, with nothing
+# showing what it said yesterday or last week.
+#
+# This step snapshots that tab once a day and appends it, dated, to a new
+# 'Cluster_Utilization_Log' tab in the MAIN Yulu ETL spreadsheet
+# (MASTER_SHEET_ID) -- turning an always-live-only view into an actual
+# time series the dashboard can chart. Written as a running log via
+# delete_rows_for_date_and_append(), same pattern as Daily Ops Metrics, so
+# re-running the same day is idempotent.
+#
+# CAVEAT, unlike every Metabase-backed step above: there is no way to ask
+# this sheet what it looked like on a past date -- it only ever has
+# "right now". History starts accumulating from whichever day this step
+# first runs; it can never be backfilled retroactively for earlier dates.
+# ─────────────────────────────────────────────────────────────
+CLUSTER_UTIL_SPREADSHEET_ID = "1fuCo3fSY0KoW6Y2UQSgtGOBiVIocD_iFEyLdAlOMAr0"
+CLUSTER_UTIL_SOURCE_TAB     = "Utilization%"
+CLUSTER_UTIL_LOG_TAB        = "Cluster_Utilization_Log"
+
+# Column order exactly as they appear left-to-right in 'Utilization%'
+# B2:L2's header row (confirmed live). "Actual live/DAU" and "Util %" are
+# percentage-formatted cells -- Sheets stores/returns those as plain
+# fractions (e.g. 0.72), so both are scaled by 100 below to land as plain
+# numbers like every other "_pct" column elsewhere in this file (91.5, not
+# 0.915).
+CLUSTER_UTIL_COLS = [
+    "cluster", "all_bikes_in_cluster", "dau_tagged", "live_in_cluster",
+    "not_reserved", "non_live_on_road", "non_live_at_warehouse",
+    "stuck_repairable", "non_live_whs_on_road",
+    "actual_live_dau_pct", "util_pct",
+]
+CLUSTER_UTIL_PCT_COLS = {"actual_live_dau_pct", "util_pct"}
+CLUSTER_UTIL_LOG_COLS_ORDER = ["date"] + CLUSTER_UTIL_COLS
+
+
+def _parse_cluster_util_rows(raw_rows: list, today: str) -> pd.DataFrame:
+    """
+    Pure transform: raw B3:L values (as returned by gspread with
+    value_render_option="UNFORMATTED_VALUE") -> one dated row per cluster.
+    Stops at the first row whose Cluster cell (column B) is blank, so it
+    naturally covers today's 9 clusters + "Out Of Cluster" + "Grand
+    Total" without a hardcoded row count -- and keeps working if a
+    cluster is ever added or removed.
+    """
+    n = len(CLUSTER_UTIL_COLS)
+    rows = []
+    for r in raw_rows:
+        if not r or r[0] is None or str(r[0]).strip() == "":
+            break
+        padded = list(r) + [None] * (n - len(r))
+        rows.append(padded[:n])
+
+    if not rows:
+        return pd.DataFrame(columns=CLUSTER_UTIL_LOG_COLS_ORDER)
+
+    df = pd.DataFrame(rows, columns=CLUSTER_UTIL_COLS)
+    for col in CLUSTER_UTIL_PCT_COLS:
+        df[col] = pd.to_numeric(df[col], errors="coerce") * 100
+    df.insert(0, "date", today)
+    return df[CLUSTER_UTIL_LOG_COLS_ORDER]
+
+
+def process_cluster_utilization_snapshot(gc: gspread.Client):
+    """See the module-level comment above this section for the full why."""
+    print("\n── STEP G: Cluster Utilization Snapshot ──")
+
+    src_ws = gc.open_by_key(CLUSTER_UTIL_SPREADSHEET_ID).worksheet(CLUSTER_UTIL_SOURCE_TAB)
+    raw_rows = src_ws.get("B3:L200", value_render_option="UNFORMATTED_VALUE")
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    result = _parse_cluster_util_rows(raw_rows, today)
+
+    if result.empty:
+        print("  WARNING: no rows found in 'Utilization%' B3:L200 — skipping snapshot.")
+        return result
+
+    delete_rows_for_date_and_append(
+        gc, MASTER_SHEET_ID, CLUSTER_UTIL_LOG_TAB, result,
+        date_col_letter="A", target_date=today, header=CLUSTER_UTIL_LOG_COLS_ORDER,
+    )
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────
 def main():
@@ -1613,6 +1703,23 @@ def main():
             "skip every date already present and leave its old values."
         ),
     )
+    parser.add_argument(
+        "--daily-ops-metrics-only",
+        action="store_true",
+        help=(
+            "Run ONLY process_daily_ops_metrics() for yesterday and exit — "
+            "skips Sweep/Octopus/Stuck/Parts_Summary/Warehouse/Cluster "
+            "Utilization entirely. Meant for a SECOND same-day run (e.g. "
+            "noon) after the normal 1 AM run: the upstream Metabase source "
+            "data for 'yesterday' is not fully settled by 1 AM, so this "
+            "re-fetches and overwrites yesterday's row once it has actually "
+            "finished landing -- same principle as never caching the "
+            "current/open month elsewhere in this file, just applied to a "
+            "single day instead of a whole month. Safe to re-run any number "
+            "of times same-day: process_daily_ops_metrics() already "
+            "deletes-then-appends yesterday's row every call."
+        ),
+    )
     args = parser.parse_args()
 
     print("Authenticating with Google Sheets…")
@@ -1625,6 +1732,11 @@ def main():
             overwrite=args.daily_ops_backfill_overwrite,
         )
         print("\n✅ Daily Ops Metrics backfill complete.")
+        return
+
+    if args.daily_ops_metrics_only:
+        process_daily_ops_metrics(gc)
+        print("\n✅ Daily Ops Metrics re-fetch complete.")
         return
 
     sweep_df      = process_sweep(gc)
@@ -1640,6 +1752,11 @@ def main():
         # column on a report that changed shape) should never take down
         # the rest of the ETL run above it.
         print(f"  WARNING: Daily Ops Metrics step failed, skipping: {e}")
+
+    try:
+        process_cluster_utilization_snapshot(gc)
+    except Exception as e:
+        print(f"  WARNING: Cluster Utilization Snapshot step failed, skipping: {e}")
 
     print("\n✅ ETL complete.")
 
