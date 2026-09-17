@@ -1724,6 +1724,15 @@ def main():
 
     print("Authenticating with Google Sheets…")
     gc = get_gspread_client()
+    try:
+        # Not a secret -- an identifier, like a username. Logged every run
+        # so that "which spreadsheets need this shared with them" is
+        # always answerable straight from the run log, instead of having
+        # to dig a service account email out of a credentials file no one
+        # has open at debugging time.
+        print(f"  Service account: {gc.auth.service_account_email}")
+    except Exception:
+        pass
 
     if args.daily_ops_backfill_start:
         end_date = args.daily_ops_backfill_end or get_yesterday()
@@ -1756,7 +1765,16 @@ def main():
     try:
         process_cluster_utilization_snapshot(gc)
     except Exception as e:
-        print(f"  WARNING: Cluster Utilization Snapshot step failed, skipping: {e}")
+        # {e!r} instead of {e} -- gspread's SpreadsheetNotFound/
+        # WorksheetNotFound are raised with NO message at all, so plain
+        # {e} silently prints an empty string and hides which exception
+        # actually fired. repr() always shows at least the exception's
+        # class name (e.g. "SpreadsheetNotFound()"), which is enough to
+        # tell "wrong ID/tab name" apart from "service account has no
+        # access to this spreadsheet" (Google's Sheets API returns 404,
+        # not 403, for a file the caller can't see, so a missing-access
+        # case and a genuinely wrong ID look identical here).
+        print(f"  WARNING: Cluster Utilization Snapshot step failed, skipping: {e!r}")
 
     print("\n✅ ETL complete.")
 
