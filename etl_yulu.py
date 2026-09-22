@@ -97,6 +97,7 @@ import argparse
 import io
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from functools import wraps
 from time import sleep
@@ -1284,18 +1285,33 @@ def process_daily_ops_metrics(gc: gspread.Client):
     report_date = get_yesterday()
     report_dt = datetime.strptime(report_date, "%Y-%m-%d").date()
 
-    demand_df = fetch_metabase_csv_range(
-        CARD_ID_DEMAND_METRICS, report_date, report_date, force_str_cols=DAILY_OPS_STR_COLS)
+    # The 3 cards are completely independent of each other (different
+    # report IDs, no shared state) -- fetched concurrently instead of one
+    # after another so the wall-clock cost is however long the SLOWEST of
+    # the three takes (Mechanic Flow Testing, usually), not the sum of
+    # all three. Each thread calls fetch_metabase_csv_range() as-is, which
+    # authenticates its own Metabase session internally -- a few extra
+    # auth round-trips is a non-issue next to the time this actually saves.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        demand_future = pool.submit(
+            fetch_metabase_csv_range, CARD_ID_DEMAND_METRICS, report_date, report_date,
+            force_str_cols=DAILY_OPS_STR_COLS)
+        token_future = pool.submit(
+            fetch_metabase_csv_range, CARD_ID_TOKEN_FLOW, report_date, report_date,
+            force_str_cols=DAILY_OPS_STR_COLS)
+        mech_future = pool.submit(
+            fetch_metabase_csv_range, CARD_ID_MECH_FLOW, report_date, report_date,
+            force_str_cols=DAILY_OPS_STR_COLS)
+        demand_df = demand_future.result()
+        token_df = token_future.result()
+        mech_df = mech_future.result()
+
     demand_df = demand_df[demand_df["city_code"] == CITY].copy()
     demand_df = demand_df[demand_df["cluster_name"].notna()].copy()
     demand_df = demand_df.rename(columns={"cluster_name": "cluster"})
 
-    token_df = fetch_metabase_csv_range(
-        CARD_ID_TOKEN_FLOW, report_date, report_date, force_str_cols=DAILY_OPS_STR_COLS)
     token_df = token_df[token_df["city"] == CITY].copy()
 
-    mech_df = fetch_metabase_csv_range(
-        CARD_ID_MECH_FLOW, report_date, report_date, force_str_cols=DAILY_OPS_STR_COLS)
     mech_df = mech_df[mech_df["city"] == CITY].copy()
     # day_start_dt (the mechanic's SHIFT day) rather than task_start_dt (the
     # raw calendar date of the task timestamp) -- confirmed live these can
@@ -1452,8 +1468,27 @@ def compute_daily_ops_metrics_range(start_date: str, end_date: str) -> dict[str,
     """
     print(f"\n── Daily Ops Metrics backfill: {start_date} -> {end_date} ──")
 
-    demand_all = _fetch_daily_ops_source_range(
-        CARD_ID_DEMAND_METRICS, "demand", start_date, end_date, DAILY_OPS_STR_COLS)
+    # Same reasoning as process_daily_ops_metrics(): these 3 sources are
+    # independent, so fetch them concurrently rather than one after
+    # another. Each is already internally month-chunked with its own
+    # cache namespace ("demand"/"token_flow"/"mech_flow" -- distinct
+    # filenames, so no collision between threads writing cache files at
+    # the same time), so this just overlaps three already-optimized
+    # fetches instead of running them back to back.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        demand_future = pool.submit(
+            _fetch_daily_ops_source_range, CARD_ID_DEMAND_METRICS, "demand",
+            start_date, end_date, DAILY_OPS_STR_COLS)
+        token_future = pool.submit(
+            _fetch_daily_ops_source_range, CARD_ID_TOKEN_FLOW, "token_flow",
+            start_date, end_date, DAILY_OPS_STR_COLS)
+        mech_future = pool.submit(
+            _fetch_daily_ops_source_range, CARD_ID_MECH_FLOW, "mech_flow",
+            start_date, end_date, DAILY_OPS_STR_COLS)
+        demand_all = demand_future.result()
+        token_all = token_future.result()
+        mech_all = mech_future.result()
+
     if demand_all.empty:
         print("  WARNING: no Demand Metrics data for the whole range — nothing to compute.")
         return {}
@@ -1461,12 +1496,8 @@ def compute_daily_ops_metrics_range(start_date: str, end_date: str) -> dict[str,
     demand_all = demand_all[demand_all["cluster_name"].notna()].copy()
     demand_all = demand_all.rename(columns={"cluster_name": "cluster"})
 
-    token_all = _fetch_daily_ops_source_range(
-        CARD_ID_TOKEN_FLOW, "token_flow", start_date, end_date, DAILY_OPS_STR_COLS)
     token_all = token_all[token_all["city"] == CITY].copy() if not token_all.empty else token_all
 
-    mech_all = _fetch_daily_ops_source_range(
-        CARD_ID_MECH_FLOW, "mech_flow", start_date, end_date, DAILY_OPS_STR_COLS)
     if not mech_all.empty:
         mech_all = mech_all[mech_all["city"] == CITY].copy()
         # day_start_dt (shift day), not task_start_dt (raw task timestamp's
