@@ -4,14 +4,18 @@ on:
   schedule:
     # 1:00 AM IST = 19:30 UTC (previous day) -- normal full daily ETL.
     - cron: "30 19 * * *"
-    # 12:00 PM IST = 06:30 UTC -- Daily Ops Metrics ONLY, re-fetching and
-    # overwriting yesterday's row. The 1 AM run's source data for
-    # "yesterday" isn't always fully settled yet at 1 AM (late-landing
-    # events keep arriving for a few hours), so this second pass re-pulls
-    # once it has actually finished settling -- same "never trust the
-    # still-open period" principle as the month-chunked caching elsewhere
-    # in this file, just applied to a single day instead of a month.
+    # 12:00 PM IST = 06:30 UTC, and 9:00 PM IST = 15:30 UTC -- Daily Ops
+    # Metrics ONLY, re-fetching and overwriting yesterday's row each time.
+    # The 1 AM run's source data for "yesterday" isn't always fully
+    # settled yet at 1 AM (late-landing events keep arriving for hours
+    # after midnight), so these later passes re-pull once it has actually
+    # finished settling -- same "never trust the still-open period"
+    # principle as the month-chunked caching elsewhere in this file, just
+    # applied to a single day instead of a month. Two passes (noon, then
+    # again at 9 PM) rather than one, since even by noon some of
+    # yesterday's data can still be incomplete.
     - cron: "30 6 * * *"
+    - cron: "30 15 * * *"
   workflow_dispatch: # allows manual trigger from GitHub UI
     inputs:
       daily_ops_backfill_start:
@@ -69,7 +73,7 @@ jobs:
           BACKFILL_START: ${{ github.event.inputs.daily_ops_backfill_start }}
           BACKFILL_END: ${{ github.event.inputs.daily_ops_backfill_end }}
           BACKFILL_OVERWRITE: ${{ github.event.inputs.daily_ops_backfill_overwrite }}
-          IS_NOON_SCHEDULE: ${{ github.event_name == 'schedule' && github.event.schedule == '30 6 * * *' }}
+          IS_METRICS_ONLY_SCHEDULE: ${{ github.event_name == 'schedule' && (github.event.schedule == '30 6 * * *' || github.event.schedule == '30 15 * * *') }}
         run: |
           if [ -n "$BACKFILL_START" ]; then
             ARGS=(--daily-ops-backfill-start "$BACKFILL_START")
@@ -80,7 +84,7 @@ jobs:
               ARGS+=(--daily-ops-backfill-overwrite)
             fi
             python etl_yulu.py "${ARGS[@]}"
-          elif [ "$IS_NOON_SCHEDULE" = "true" ]; then
+          elif [ "$IS_METRICS_ONLY_SCHEDULE" = "true" ]; then
             python etl_yulu.py --daily-ops-metrics-only
           else
             python etl_yulu.py
