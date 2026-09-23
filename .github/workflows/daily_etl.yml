@@ -4,17 +4,15 @@ on:
   schedule:
     # 1:00 AM IST = 19:30 UTC (previous day) -- normal full daily ETL.
     - cron: "30 19 * * *"
-    # 12:00 PM IST = 06:30 UTC, and 9:00 PM IST = 15:30 UTC -- Daily Ops
-    # Metrics ONLY, re-fetching and overwriting yesterday's row each time.
-    # The 1 AM run's source data for "yesterday" isn't always fully
-    # settled yet at 1 AM (late-landing events keep arriving for hours
-    # after midnight), so these later passes re-pull once it has actually
-    # finished settling -- same "never trust the still-open period"
-    # principle as the month-chunked caching elsewhere in this file, just
-    # applied to a single day instead of a month. Two passes (noon, then
-    # again at 9 PM) rather than one, since even by noon some of
-    # yesterday's data can still be incomplete.
-    - cron: "30 6 * * *"
+    # 1:00 PM IST = 07:30 UTC, and 9:00 PM IST = 15:30 UTC -- Daily Ops
+    # Metrics ONLY. The 1 AM run above no longer computes Daily Ops
+    # Metrics at all (etl_yulu.py's main() deliberately skips STEP F on
+    # the normal daily path) -- confirmed the source data for "yesterday"
+    # isn't reliably settled that early, so writing a row at 1 AM just
+    # means writing one already known to be wrong. Its FIRST computation
+    # is this 1 PM pass instead; the 9 PM pass re-fetches and overwrites
+    # that row a second time once the data has had even longer to settle.
+    - cron: "30 7 * * *"
     - cron: "30 15 * * *"
   workflow_dispatch: # allows manual trigger from GitHub UI
     inputs:
@@ -73,7 +71,7 @@ jobs:
           BACKFILL_START: ${{ github.event.inputs.daily_ops_backfill_start }}
           BACKFILL_END: ${{ github.event.inputs.daily_ops_backfill_end }}
           BACKFILL_OVERWRITE: ${{ github.event.inputs.daily_ops_backfill_overwrite }}
-          IS_METRICS_ONLY_SCHEDULE: ${{ github.event_name == 'schedule' && (github.event.schedule == '30 6 * * *' || github.event.schedule == '30 15 * * *') }}
+          IS_METRICS_ONLY_SCHEDULE: ${{ github.event_name == 'schedule' && (github.event.schedule == '30 7 * * *' || github.event.schedule == '30 15 * * *') }}
         run: |
           if [ -n "$BACKFILL_START" ]; then
             ARGS=(--daily-ops-backfill-start "$BACKFILL_START")

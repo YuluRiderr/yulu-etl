@@ -1805,13 +1805,15 @@ def main():
     process_parts_summary(gc, df_final, df2)
     process_warehouse(gc)
 
-    try:
-        process_daily_ops_metrics(gc)
-    except Exception as e:
-        # Non-blocking: a failure here (e.g. MetabaseQueryError, a missing
-        # column on a report that changed shape) should never take down
-        # the rest of the ETL run above it.
-        print(f"  WARNING: Daily Ops Metrics step failed, skipping: {e}")
+    # Daily Ops Metrics is deliberately NOT computed here at 1 AM anymore
+    # -- confirmed the underlying Metabase source data for "yesterday"
+    # isn't reliably settled yet that early, so writing a row here just
+    # means writing one we already know is likely wrong. It's instead
+    # computed for the first time at 1 PM IST, then re-fetched again at
+    # 9 PM IST -- see daily_etl.yml's two --daily-ops-metrics-only cron
+    # entries. This 1 AM run only handles the live/current-state steps
+    # above (Sweep/Octopus/Stuck/Warehouse), which have no such
+    # settling-time problem.
 
     try:
         process_cluster_utilization_snapshot(gc)
