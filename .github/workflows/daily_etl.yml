@@ -7,11 +7,16 @@ on:
     # 1:00 PM IST = 07:30 UTC, and 9:00 PM IST = 15:30 UTC -- Daily Ops
     # Metrics ONLY. The 1 AM run above no longer computes Daily Ops
     # Metrics at all (etl_yulu.py's main() deliberately skips STEP F on
-    # the normal daily path) -- confirmed the source data for "yesterday"
-    # isn't reliably settled that early, so writing a row at 1 AM just
-    # means writing one already known to be wrong. Its FIRST computation
-    # is this 1 PM pass instead; the 9 PM pass re-fetches and overwrites
-    # that row a second time once the data has had even longer to settle.
+    # the normal daily path) -- confirmed the source data isn't reliably
+    # settled that early, so writing a row at 1 AM just means writing one
+    # already known to be wrong. Its FIRST computation is this 1 PM pass
+    # instead; the 9 PM pass re-fetches and overwrites the SAME rolling
+    # window a second time. Each of these two passes recomputes and
+    # overwrites a trailing multi-day window (DAILY_OPS_REFRESH_WINDOW_DAYS
+    # in etl_yulu.py), not just yesterday alone -- the source data keeps
+    # drifting for more than a single day after the fact, so a date needs
+    # to be re-touched across more than one calendar day to actually catch
+    # up with it.
     - cron: "30 7 * * *"
     - cron: "30 15 * * *"
   workflow_dispatch: # allows manual trigger from GitHub UI

@@ -70,8 +70,9 @@ PATCH NOTE (this version, Daily Ops Metrics backfill folded in):
   range instead of once per day. The per-date math itself
   (_compute_daily_ops_rows_for_date) is now a single shared function used
   by BOTH the daily run (process_daily_ops_metrics, one real Metabase call
-  per card scoped to exactly yesterday) and the backfill (one bulk fetch,
-  sliced locally per date) — previously this logic was duplicated
+  per card scoped to a rolling trailing window -- see
+  DAILY_OPS_REFRESH_WINDOW_DAYS -- not just yesterday) and the backfill
+  (one bulk fetch, sliced locally per date) — previously this logic was duplicated
   practically verbatim between this file and the standalone backfill
   script, which is exactly the kind of drift risk folding them together
   removes.
@@ -1268,22 +1269,39 @@ def _compute_daily_ops_rows_for_date(demand_day: pd.DataFrame, token_day: pd.Dat
     return result[DAILY_OPS_COLS_ORDER]
 
 
+# How many trailing days (ending at yesterday) get recomputed and
+# overwritten EVERY run of process_daily_ops_metrics(), not just
+# yesterday alone. Confirmed live: the underlying Metabase source data
+# for a given day keeps changing for more than 24 hours after the fact
+# (late-landing/corrected events), so the old behaviour -- touching only
+# "yesterday" at each of the 1 PM / 9 PM passes -- meant the day before
+# yesterday got written once and then frozen forever, even while its
+# source kept drifting for another day or two. Re-touching a wider
+# trailing window every run means any date whose source has settled by
+# now gets corrected, not just the newest one.
+DAILY_OPS_REFRESH_WINDOW_DAYS = 3
+
+
 def process_daily_ops_metrics(gc: gspread.Client):
     """
-    New tab 'Daily_Ops_Metrics': one row per BLR cluster for yesterday
-    (the last fully-closed day) — see _compute_daily_ops_rows_for_date()
-    for the full metric definitions/math, which this just feeds with a
-    single day's worth of data from 3 fresh, single-day Metabase fetches.
+    'Daily_Ops_Metrics' tab: one row per BLR cluster for each of the
+    trailing DAILY_OPS_REFRESH_WINDOW_DAYS days (ending at yesterday) —
+    see _compute_daily_ops_rows_for_date() for the full metric
+    definitions/math. Every date in the window is deleted and
+    re-appended fresh via delete_rows_for_date_and_append(), independent
+    of the other dates in the same run — see DAILY_OPS_REFRESH_WINDOW_DAYS
+    above for why a single-date window isn't enough.
 
     Every source is hard-filtered to city == "BLR" before any computation
     — no other city's rows ever reach a groupby here.
-
-    Written as a running log via delete_rows_for_date_and_append() — see
-    that function's docstring — not a full replace.
     """
-    print("\n── STEP F: Daily Ops Metrics ──")
-    report_date = get_yesterday()
-    report_dt = datetime.strptime(report_date, "%Y-%m-%d").date()
+    end_date = get_yesterday()
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
+    start_dt = end_dt - timedelta(days=DAILY_OPS_REFRESH_WINDOW_DAYS - 1)
+    start_date = start_dt.strftime("%Y-%m-%d")
+
+    print(f"\n── STEP F: Daily Ops Metrics ({start_date} -> {end_date}, "
+          f"{DAILY_OPS_REFRESH_WINDOW_DAYS}-day rolling refresh) ──")
 
     # The 3 cards are completely independent of each other (different
     # report IDs, no shared state) -- fetched concurrently instead of one
@@ -1292,48 +1310,75 @@ def process_daily_ops_metrics(gc: gspread.Client):
     # all three. Each thread calls fetch_metabase_csv_range() as-is, which
     # authenticates its own Metabase session internally -- a few extra
     # auth round-trips is a non-issue next to the time this actually saves.
+    # ONE range fetch per card covers the whole window -- not one fetch
+    # per day -- then each date is sliced out of it locally below, same
+    # pattern as the backfill's per-month fetch already uses.
     with ThreadPoolExecutor(max_workers=3) as pool:
         demand_future = pool.submit(
-            fetch_metabase_csv_range, CARD_ID_DEMAND_METRICS, report_date, report_date,
+            fetch_metabase_csv_range, CARD_ID_DEMAND_METRICS, start_date, end_date,
             force_str_cols=DAILY_OPS_STR_COLS)
         token_future = pool.submit(
-            fetch_metabase_csv_range, CARD_ID_TOKEN_FLOW, report_date, report_date,
+            fetch_metabase_csv_range, CARD_ID_TOKEN_FLOW, start_date, end_date,
             force_str_cols=DAILY_OPS_STR_COLS)
         mech_future = pool.submit(
-            fetch_metabase_csv_range, CARD_ID_MECH_FLOW, report_date, report_date,
+            fetch_metabase_csv_range, CARD_ID_MECH_FLOW, start_date, end_date,
             force_str_cols=DAILY_OPS_STR_COLS)
-        demand_df = demand_future.result()
-        token_df = token_future.result()
-        mech_df = mech_future.result()
+        demand_all = demand_future.result()
+        token_all = token_future.result()
+        mech_all = mech_future.result()
 
-    demand_df = demand_df[demand_df["city_code"] == CITY].copy()
-    demand_df = demand_df[demand_df["cluster_name"].notna()].copy()
-    demand_df = demand_df.rename(columns={"cluster_name": "cluster"})
+    demand_all = demand_all[demand_all["city_code"] == CITY].copy()
+    demand_all = demand_all[demand_all["cluster_name"].notna()].copy()
+    demand_all = demand_all.rename(columns={"cluster_name": "cluster"})
 
-    token_df = token_df[token_df["city"] == CITY].copy()
+    token_all = token_all[token_all["city"] == CITY].copy() if not token_all.empty else token_all
 
-    mech_df = mech_df[mech_df["city"] == CITY].copy()
-    # day_start_dt (the mechanic's SHIFT day) rather than task_start_dt (the
-    # raw calendar date of the task timestamp) -- confirmed live these can
-    # differ: a task at 05:48 on the 14th can carry day_start_dt=13th when
-    # it belongs to a shift that started the evening of the 13th. Using
-    # task_start_dt would misattribute overnight tasks to the wrong
-    # business day, both for which date's row they land in AND for the
-    # >90-day eligibility check below (which must be "as of" the correct day).
-    mech_df["day_start_dt"]    = pd.to_datetime(mech_df["day_start_dt"], errors="coerce").dt.date
-    mech_df["date_of_joining"] = pd.to_datetime(mech_df["date_of_joining"], errors="coerce").dt.date
-    mech_df = mech_df[mech_df["day_start_dt"] == report_dt].copy()
-    mech_df["bike_name"] = normalise_bike_id(mech_df["bike_name"])
-    mech_df["days_old"] = mech_df["date_of_joining"].map(
-        lambda d: (report_dt - d).days if pd.notna(d) else None)
+    if not mech_all.empty:
+        mech_all = mech_all[mech_all["city"] == CITY].copy()
+        # day_start_dt (the mechanic's SHIFT day) rather than task_start_dt
+        # (the raw calendar date of the task timestamp) -- confirmed live
+        # these can differ: a task at 05:48 on the 14th can carry
+        # day_start_dt=13th when it belongs to a shift that started the
+        # evening of the 13th. Using task_start_dt would misattribute
+        # overnight tasks to the wrong business day, both for which date's
+        # row they land in AND for the >90-day eligibility check below
+        # (which must be "as of" the correct day).
+        mech_all["day_start_dt"]    = pd.to_datetime(mech_all["day_start_dt"], errors="coerce").dt.date
+        mech_all["date_of_joining"] = pd.to_datetime(mech_all["date_of_joining"], errors="coerce").dt.date
+        mech_all["bike_name"] = normalise_bike_id(mech_all["bike_name"])
 
-    result = _compute_daily_ops_rows_for_date(demand_df, token_df, mech_df, report_date)
+    last_result = None
+    for offset in range(DAILY_OPS_REFRESH_WINDOW_DAYS):
+        report_dt = start_dt + timedelta(days=offset)
+        report_date = report_dt.strftime("%Y-%m-%d")
 
-    delete_rows_for_date_and_append(
-        gc, MASTER_SHEET_ID, DAILY_OPS_SHEET_TAB, result,
-        date_col_letter="B", target_date=report_date, header=DAILY_OPS_COLS_ORDER,
-    )
-    return result
+        demand_day = demand_all[demand_all["date"] == report_date]
+        if demand_day.empty:
+            print(f"  {report_date}: no Demand Metrics data in this fetch — skipping "
+                  f"(real gap; existing row for this date, if any, is left untouched).")
+            continue
+
+        token_day = (
+            pd.DataFrame(columns=_TOKEN_DAY_EMPTY_COLS) if token_all.empty
+            else token_all[token_all["checkin_date"] == report_date].copy()
+        )
+
+        if mech_all.empty:
+            mech_day = pd.DataFrame(columns=_MECH_DAY_EMPTY_COLS)
+        else:
+            mech_day = mech_all[mech_all["day_start_dt"] == report_dt].copy()
+            mech_day["days_old"] = mech_day["date_of_joining"].map(
+                lambda d: (report_dt - d).days if pd.notna(d) else None)
+
+        result = _compute_daily_ops_rows_for_date(demand_day, token_day, mech_day, report_date)
+
+        delete_rows_for_date_and_append(
+            gc, MASTER_SHEET_ID, DAILY_OPS_SHEET_TAB, result,
+            date_col_letter="B", target_date=report_date, header=DAILY_OPS_COLS_ORDER,
+        )
+        last_result = result
+
+    return last_result
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1761,17 +1806,17 @@ def main():
         "--daily-ops-metrics-only",
         action="store_true",
         help=(
-            "Run ONLY process_daily_ops_metrics() for yesterday and exit — "
-            "skips Sweep/Octopus/Stuck/Parts_Summary/Warehouse/Cluster "
-            "Utilization entirely. Meant for a SECOND same-day run (e.g. "
-            "noon) after the normal 1 AM run: the upstream Metabase source "
-            "data for 'yesterday' is not fully settled by 1 AM, so this "
-            "re-fetches and overwrites yesterday's row once it has actually "
-            "finished landing -- same principle as never caching the "
+            "Run ONLY process_daily_ops_metrics() and exit — skips Sweep/"
+            "Octopus/Stuck/Parts_Summary/Warehouse/Cluster Utilization "
+            "entirely. Recomputes and overwrites a trailing "
+            "DAILY_OPS_REFRESH_WINDOW_DAYS-day window ending yesterday "
+            "(not just yesterday alone) every call, since the upstream "
+            "Metabase source data keeps changing for more than a single "
+            "day after the fact -- same principle as never caching the "
             "current/open month elsewhere in this file, just applied to a "
-            "single day instead of a whole month. Safe to re-run any number "
-            "of times same-day: process_daily_ops_metrics() already "
-            "deletes-then-appends yesterday's row every call."
+            "short rolling window instead of a whole month. Safe to re-run "
+            "any number of times same-day: every date in the window is "
+            "independently deleted-then-appended."
         ),
     )
     args = parser.parse_args()
