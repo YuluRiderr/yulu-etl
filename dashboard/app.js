@@ -30,7 +30,21 @@ const METRIC_TABS = [
 ];
 
 const DATA = window.OPS_DATA || { anchor_date: null, days_captured: 0, clusters: {}, dates: [], series: {} };
+// Yulu-Centre-wise fulfillment breakdown -- a separate, additive object
+// nested under DATA.by_centre by build_data.py; same shape as DATA
+// itself (anchor_date/days_captured/clusters/dates/series), just keyed
+// by individual centre name instead of cluster.
+const BYCENTRE = DATA.by_centre || { anchor_date: null, days_captured: 0, clusters: {}, dates: [], series: {} };
+
+const CENTRE_METRIC_TABS = [
+  { key: "service_swap_fulfillment_pct_user", label: "Swap Fulfillment (User)", fmt: v => v.toFixed(1), unit: "%" },
+  { key: "service_swap_fulfillment_pct_token", label: "Swap Fulfillment (Token)", fmt: v => v.toFixed(1), unit: "%" },
+  { key: "attachment_fulfillment_pct_user", label: "Attach Fulfillment (User)", fmt: v => v.toFixed(1), unit: "%" },
+  { key: "attachment_fulfillment_pct_token", label: "Attach Fulfillment (Token)", fmt: v => v.toFixed(1), unit: "%" },
+];
+
 let ACTIVE_TAB = 0;
+let ACTIVE_CENTRE_TAB = 0;
 let ACTIVE_CLUSTER = BLR_TOTAL_LABEL;
 const CHART_INSTANCES = [];
 
@@ -55,6 +69,16 @@ function allClusterChoices() {
 
 function get(cluster, metric, period) {
   const c = DATA.clusters[cluster];
+  if (!c || !c[metric]) return null;
+  return c[metric][period];
+}
+
+function centreNames() {
+  return Object.keys(BYCENTRE.clusters).filter(c => c !== BLR_TOTAL_LABEL).sort();
+}
+
+function getCentre(centre, metric, period) {
+  const c = BYCENTRE.clusters[centre];
   if (!c || !c[metric]) return null;
   return c[metric][period];
 }
@@ -261,6 +285,57 @@ function sectionCompare() {
     </section>`;
 }
 
+function sectionByCentre() {
+  if (!BYCENTRE.anchor_date) {
+    return `
+      <section id="bycentre">
+        <div class="eyebrow">By Yulu Centre</div>
+        <div class="title disp" style="font-size:28px;">Fulfillment by Individual Centre</div>
+        <div class="panel"><div class="empty-note">No centre-level data captured yet — this fills in once Daily_Ops_Metrics_ByCentre's first run lands.</div></div>
+      </section>`;
+  }
+
+  const tabs = CENTRE_METRIC_TABS.map((t, i) =>
+    `<button class="tab ${i === ACTIVE_CENTRE_TAB ? "on" : ""}" onclick="setCentreTab(${i})">${t.label}</button>`
+  ).join("");
+
+  const metric = CENTRE_METRIC_TABS[ACTIVE_CENTRE_TAB];
+  const rows = [BLR_TOTAL_LABEL, ...centreNames()];
+
+  const body = rows.map(centre => {
+    const cells = PERIOD_KEYS.map((pk, i) => {
+      const v = getCentre(centre, metric.key, pk);
+      if (v === null || v === undefined) return `<td class="dash">–</td>`;
+      let deltaHtml = "";
+      if (i > 0) {
+        const prev = getCentre(centre, metric.key, PERIOD_KEYS[i - 1]);
+        if (prev !== null && prev !== undefined && prev !== 0) {
+          const pct = ((v - prev) / Math.abs(prev)) * 100;
+          const dir = pct >= 0 ? "up" : "down";
+          const arrow = pct >= 0 ? "▲" : "▼";
+          deltaHtml = `<span class="delta ${dir}">${arrow}${Math.abs(pct).toFixed(0)}%</span>`;
+        }
+      }
+      return `<td class="num">${metric.fmt(v)}${metric.unit}${deltaHtml}</td>`;
+    }).join("");
+    return `<tr class="${centre === BLR_TOTAL_LABEL ? "total" : ""}"><td>${centre}</td>${cells}</tr>`;
+  }).join("");
+
+  return `
+    <section id="bycentre">
+      <div class="eyebrow">By Yulu Centre</div>
+      <div class="title disp" style="font-size:28px;">Fulfillment by Individual Centre</div>
+      <p class="deck-desc">Same fulfillment% definitions as the cluster-level Period Comparison, broken down by individual Yulu Centre instead — each column compared against the one just before it in time.</p>
+      <div class="tabs">${tabs}</div>
+      <div class="panel" style="overflow-x:auto;">
+        <table class="ptable">
+          <thead><tr><th>Yulu Centre</th>${PERIOD_KEYS.map(k => `<th>${PERIOD_LABELS[k]}</th>`).join("")}</tr></thead>
+          <tbody>${body}</tbody>
+        </table>
+      </div>
+    </section>`;
+}
+
 function sectionClusters() {
   const dauRows = clusterNames().map(c => ({ name: c, dau: get(c, "dau", "latest") }));
   const prodRows = clusterNames().map(c => ({ name: c, v: get(c, "mechanic_productivity_90d", "latest") }));
@@ -347,12 +422,14 @@ function render() {
     sectionTrends(),
     sectionCompare(),
     sectionClusters(),
+    sectionByCentre(),
     sectionAttention(),
   ].join("");
   renderCharts();
 }
 
 function setTab(i) { ACTIVE_TAB = i; render(); }
+function setCentreTab(i) { ACTIVE_CENTRE_TAB = i; render(); }
 function setCluster(c) { ACTIVE_CLUSTER = c; render(); }
 
 document.getElementById("asOfLabel").textContent = fmtDate(DATA.anchor_date);

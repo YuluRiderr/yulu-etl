@@ -144,6 +144,18 @@ DAILY_OPS_COLS_ORDER = [
     "enquiry_total", "enquiry_to_attachment_pct",
 ]
 
+# Yulu-Centre-wise (individual station) fulfillment breakdown -- a
+# SEPARATE tab from DAILY_OPS_SHEET_TAB above, not a replacement. Only
+# fulfillment%/TAT are reported at this granularity (see
+# _compute_daily_ops_rows_by_centre_for_date for why DAU/mechanic
+# productivity aren't).
+DAILY_OPS_BYCENTRE_SHEET_TAB = "Daily_Ops_Metrics_ByCentre"
+DAILY_OPS_BYCENTRE_COLS_ORDER = [
+    "yulu_centre", "date",
+    "service_swap_fulfillment_pct_user", "service_swap_fulfillment_pct_token", "service_swap_tat_mins",
+    "attachment_fulfillment_pct_user", "attachment_fulfillment_pct_token", "attachment_tat_mins",
+]
+
 # On-disk cache for CLOSED calendar months only -- same model/naming
 # convention as the reference sync script's MECHANICS_AUDIT_CACHE_DIR /
 # CLUSTER_KPI_CACHE_DIR. One gzipped CSV per (source_label, "YYYY-MM").
@@ -1083,10 +1095,14 @@ def process_warehouse(gc: gspread.Client) -> pd.DataFrame:
 #   Demand Metrics (12245) + Token Flow (11765) + Mechanic Flow Testing (8966)
 # ─────────────────────────────────────────────────────────────
 def _token_fulfillment_metrics(token_df: pd.DataFrame, type_value: str,
-                                col_prefix: str) -> pd.DataFrame:
+                                col_prefix: str, group_col: str = "cluster") -> pd.DataFrame:
     """
-    Per-cluster fulfillment% (user-level and token-level) + mean TAT for
+    Per-group fulfillment% (user-level and token-level) + mean TAT for
     one token_type_derived value (e.g. "service_swap" or "Attach").
+    `group_col` defaults to "cluster" (the original/only behaviour); the
+    Yulu-Centre-wise breakdown reuses this exact same function with
+    group_col="yc_name" instead, so both granularities share one
+    implementation of the fulfillment% math.
 
       token-level fulfillment% = closed tokens / total tokens of that type
       user-level fulfillment%  = unique users with >=1 closed token of
@@ -1095,7 +1111,7 @@ def _token_fulfillment_metrics(token_df: pd.DataFrame, type_value: str,
       TAT                      = mean checkin_to_fulfilled_tat_mins over
                                   CLOSED tokens of that type only
     """
-    cols = ["cluster",
+    cols = [group_col,
             f"{col_prefix}_fulfillment_pct_user",
             f"{col_prefix}_fulfillment_pct_token",
             f"{col_prefix}_tat_mins"]
@@ -1106,11 +1122,11 @@ def _token_fulfillment_metrics(token_df: pd.DataFrame, type_value: str,
 
     closed = sub[sub["token_status"] == "Closed"]
 
-    token_total  = sub.groupby("cluster")["token_id"].nunique().rename("token_total")
-    token_closed = closed.groupby("cluster")["token_id"].nunique().rename("token_closed")
-    user_total   = sub.groupby("cluster")["user_id"].nunique().rename("user_total")
-    user_closed  = closed.groupby("cluster")["user_id"].nunique().rename("user_closed")
-    tat          = closed.groupby("cluster")["checkin_to_fulfilled_tat_mins"].mean().rename("tat_mins")
+    token_total  = sub.groupby(group_col)["token_id"].nunique().rename("token_total")
+    token_closed = closed.groupby(group_col)["token_id"].nunique().rename("token_closed")
+    user_total   = sub.groupby(group_col)["user_id"].nunique().rename("user_total")
+    user_closed  = closed.groupby(group_col)["user_id"].nunique().rename("user_closed")
+    tat          = closed.groupby(group_col)["checkin_to_fulfilled_tat_mins"].mean().rename("tat_mins")
 
     out = pd.concat([token_total, token_closed, user_total, user_closed, tat], axis=1)
     out[["token_total", "token_closed", "user_total", "user_closed"]] = (
@@ -1124,6 +1140,68 @@ def _token_fulfillment_metrics(token_df: pd.DataFrame, type_value: str,
     out[f"{col_prefix}_tat_mins"] = out["tat_mins"].round(1)
 
     return out.reset_index()[cols]
+
+
+def _compute_daily_ops_rows_by_centre_for_date(token_day: pd.DataFrame, report_date: str) -> pd.DataFrame:
+    """
+    Same fulfillment%/TAT math as the cluster-level Daily Ops Metrics
+    (_token_fulfillment_metrics — identical implementation, just grouped
+    by yc_name, the individual Yulu Centre/station, instead of cluster).
+
+    Only service_swap/attachment fulfillment%+TAT are reported at this
+    granularity — DAU and mechanic productivity are NOT, because neither
+    source card has a per-centre breakdown for them (Demand Metrics'
+    DAU is cluster-level only; Mechanic Flow's productivity is scoped to
+    a mechanic's start_cluster, not an individual centre), so there's
+    nothing to compute here for either.
+
+    A synthetic "BLR (Total)" row is included for the same reason as the
+    cluster-level tab: duplicating every row under BLR_TOTAL_LABEL before
+    the groupby, so the SAME aggregation code produces a genuine
+    whole-city rollup (closed÷total across every centre) rather than an
+    average of per-centre percentages.
+    """
+    if token_day.empty or "yc_name" not in token_day.columns:
+        return pd.DataFrame(columns=DAILY_OPS_BYCENTRE_COLS_ORDER)
+
+    token_df = token_day.rename(columns={"yc_name": "centre"})
+    token_df = token_df[token_df["centre"].notna() & (token_df["centre"].astype(str).str.strip() != "")]
+    if token_df.empty:
+        return pd.DataFrame(columns=DAILY_OPS_BYCENTRE_COLS_ORDER)
+
+    token_df = pd.concat(
+        [token_df, token_df.assign(centre=BLR_TOTAL_LABEL)], ignore_index=True)
+
+    swap_metrics   = _token_fulfillment_metrics(token_df, "service_swap", "service_swap", group_col="centre")
+    attach_metrics = _token_fulfillment_metrics(token_df, "Attach", "attachment", group_col="centre")
+
+    result = swap_metrics.merge(attach_metrics, on="centre", how="outer")
+    result = result.rename(columns={"centre": "yulu_centre"})
+    result.insert(1, "date", report_date)
+    for col in DAILY_OPS_BYCENTRE_COLS_ORDER:
+        if col not in result.columns:
+            result[col] = None
+    return result[DAILY_OPS_BYCENTRE_COLS_ORDER]
+
+
+def _prep_demand_df(demand_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Filters Demand Metrics (card 12245) to BLR and renames cluster_name ->
+    cluster. FIX: previously this unconditionally DROPPED every row with
+    a blank/null cluster_name via `.notna()` -- but a blank dimension
+    value in an otherwise per-cluster breakdown is the classic signature
+    of a GROUP BY ROLLUP/CUBE grand-total row. If Demand Metrics provides
+    one, it's the ONLY way to get a genuinely correct city-wide DAU (a
+    real distinct-user count) — this card is already pre-aggregated per
+    cluster, so there's no user-level data left on our side to dedupe
+    from once it's fetched. Relabeling that row as BLR_TOTAL_LABEL
+    (instead of discarding it) lets _compute_daily_ops_rows_for_date()
+    use it directly when present, falling back to the old (overcounting)
+    per-cluster sum only when no such row exists for that date.
+    """
+    demand_df = demand_df[demand_df["city_code"] == CITY].copy()
+    demand_df["cluster_name"] = demand_df["cluster_name"].fillna(BLR_TOTAL_LABEL)
+    return demand_df.rename(columns={"cluster_name": "cluster"})
 
 
 def _compute_daily_ops_rows_for_date(demand_day: pd.DataFrame, token_day: pd.DataFrame,
@@ -1170,10 +1248,30 @@ def _compute_daily_ops_rows_for_date(demand_day: pd.DataFrame, token_day: pd.Dat
     caller — no other city's rows should ever reach this function.
     """
     base = demand_day[["cluster", "dau"]].copy()
-    base = pd.concat(
-        [pd.DataFrame([{"cluster": BLR_TOTAL_LABEL, "dau": base["dau"].sum()}]), base],
-        ignore_index=True,
-    )
+    if (base["cluster"] == BLR_TOTAL_LABEL).any():
+        # The caller already relabeled a blank/null cluster_name row (the
+        # classic signature of a GROUP BY ROLLUP grand-total row) as
+        # BLR_TOTAL_LABEL -- Demand Metrics is providing its OWN
+        # already-deduplicated city-wide DAU directly. Use it as-is.
+        pass
+    else:
+        # FIX: no genuine total row available from the source for this
+        # date -- fall back to summing per-cluster DAU. This OVERCOUNTS
+        # any user active in more than one cluster the same day, since
+        # DAU is inherently a distinct-user count, not additive across
+        # clusters (confirmed as a real bug: this used to be the ONLY
+        # path, unconditionally, even on dates where Metabase did supply
+        # a real total). Flagged loudly so the limitation is visible in
+        # the run log instead of silently producing an inflated BLR
+        # (Total) DAU forever.
+        print(f"  WARNING: Demand Metrics has no genuine city-wide total row for "
+              f"{report_date} -- BLR (Total) DAU falls back to summing per-cluster "
+              f"values, which OVERCOUNTS users active in more than one cluster "
+              f"that day.")
+        base = pd.concat(
+            [pd.DataFrame([{"cluster": BLR_TOTAL_LABEL, "dau": base["dau"].sum()}]), base],
+            ignore_index=True,
+        )
 
     # Duplicate every BLR row under BLR_TOTAL_LABEL so the same per-cluster
     # groupby logic below also produces a genuine whole-city aggregate row.
@@ -1294,6 +1392,13 @@ def process_daily_ops_metrics(gc: gspread.Client):
 
     Every source is hard-filtered to city == "BLR" before any computation
     — no other city's rows ever reach a groupby here.
+
+    Also writes 'Daily_Ops_Metrics_ByCentre' (see
+    _compute_daily_ops_rows_by_centre_for_date) — the same fulfillment%
+    metrics broken down by individual Yulu Centre instead of cluster, for
+    the dashboard's centre-level view. A separate tab, same rolling
+    window, same delete-then-append pattern; the cluster-level tab above
+    is unaffected by this.
     """
     end_date = get_yesterday()
     end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
@@ -1327,9 +1432,7 @@ def process_daily_ops_metrics(gc: gspread.Client):
         token_all = token_future.result()
         mech_all = mech_future.result()
 
-    demand_all = demand_all[demand_all["city_code"] == CITY].copy()
-    demand_all = demand_all[demand_all["cluster_name"].notna()].copy()
-    demand_all = demand_all.rename(columns={"cluster_name": "cluster"})
+    demand_all = _prep_demand_df(demand_all)
 
     token_all = token_all[token_all["city"] == CITY].copy() if not token_all.empty else token_all
 
@@ -1376,6 +1479,18 @@ def process_daily_ops_metrics(gc: gspread.Client):
             gc, MASTER_SHEET_ID, DAILY_OPS_SHEET_TAB, result,
             date_col_letter="B", target_date=report_date, header=DAILY_OPS_COLS_ORDER,
         )
+
+        # Yulu-Centre-wise fulfillment breakdown -- a separate tab, same
+        # rolling-window recompute, reusing this date's already-fetched
+        # token_day (no extra Metabase call). Written independently of the
+        # cluster-level tab above so a hiccup in one never blocks the other.
+        by_centre_result = _compute_daily_ops_rows_by_centre_for_date(token_day, report_date)
+        if not by_centre_result.empty:
+            delete_rows_for_date_and_append(
+                gc, MASTER_SHEET_ID, DAILY_OPS_BYCENTRE_SHEET_TAB, by_centre_result,
+                date_col_letter="B", target_date=report_date, header=DAILY_OPS_BYCENTRE_COLS_ORDER,
+            )
+
         last_result = result
 
     return last_result
@@ -1537,9 +1652,7 @@ def compute_daily_ops_metrics_range(start_date: str, end_date: str) -> dict[str,
     if demand_all.empty:
         print("  WARNING: no Demand Metrics data for the whole range — nothing to compute.")
         return {}
-    demand_all = demand_all[demand_all["city_code"] == CITY].copy()
-    demand_all = demand_all[demand_all["cluster_name"].notna()].copy()
-    demand_all = demand_all.rename(columns={"cluster_name": "cluster"})
+    demand_all = _prep_demand_df(demand_all)
 
     token_all = token_all[token_all["city"] == CITY].copy() if not token_all.empty else token_all
 

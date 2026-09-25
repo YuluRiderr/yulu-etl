@@ -20,6 +20,12 @@ Reuses the exact same Google auth pattern and secret name
 (GOOGLE_SERVICE_ACCOUNT_JSON) as etl_yulu.py, and the same MASTER_SHEET_ID
 / 'Daily_Ops_Metrics' tab that its STEP F writes to — nothing here talks to
 Metabase directly.
+
+Also fetches 'Daily_Ops_Metrics_ByCentre' (written alongside the main tab
+by the same STEP F run) and aggregates it the same two ways, nested under
+a separate top-level "by_centre" key in data.js — fulfillment%/TAT only,
+grouped by individual Yulu Centre instead of cluster. Additive: the
+existing top-level "clusters"/"dates"/"series" keys are untouched.
 """
 
 import json
@@ -31,6 +37,7 @@ import gspread
 
 MASTER_SHEET_ID = "1fBjHKwlxRGwjsOSjzHOB6cUjvaKrhvtXdaPGeZjZuH0"
 SHEET_TAB = "Daily_Ops_Metrics"
+BYCENTRE_SHEET_TAB = "Daily_Ops_Metrics_ByCentre"
 BLR_TOTAL_LABEL = "BLR (Total)"
 
 METRICS = [
@@ -39,6 +46,14 @@ METRICS = [
     "attachment_fulfillment_pct_user", "attachment_fulfillment_pct_token", "attachment_tat_mins",
     "mechanic_productivity_90d",
     "enquiry_total", "enquiry_to_attachment_pct",
+]
+
+# Fulfillment%/TAT only -- BYCENTRE_SHEET_TAB has no dau/mechanic
+# productivity columns (see etl_yulu.py's
+# _compute_daily_ops_rows_by_centre_for_date for why).
+CENTRE_METRICS = [
+    "service_swap_fulfillment_pct_user", "service_swap_fulfillment_pct_token", "service_swap_tat_mins",
+    "attachment_fulfillment_pct_user", "attachment_fulfillment_pct_token", "attachment_tat_mins",
 ]
 # Every metric, including enquiry_total, is AVERAGED per day over a
 # period -- not summed. A summed window total isn't comparable against a
@@ -71,9 +86,9 @@ def get_gspread_client() -> gspread.Client:
     return gspread.service_account(filename="service_account.json")
 
 
-def fetch_rows() -> list[dict]:
+def fetch_rows(tab: str) -> list[dict]:
     gc = get_gspread_client()
-    ws = gc.open_by_key(MASTER_SHEET_ID).worksheet(SHEET_TAB)
+    ws = gc.open_by_key(MASTER_SHEET_ID).worksheet(tab)
     return ws.get_all_records()
 
 
@@ -86,11 +101,11 @@ def to_float(v):
         return None
 
 
-def build_period_comparison(by_cluster_date: dict, anchor: date) -> dict:
+def build_period_comparison(by_cluster_date: dict, anchor: date, metrics: list[str] = METRICS) -> dict:
     clusters_out = {}
     for cluster, date_map in by_cluster_date.items():
         metrics_out = {}
-        for metric in METRICS:
+        for metric in metrics:
             periods_out = {}
             for label, start_off, end_off in PERIODS:
                 vals = []
@@ -113,7 +128,7 @@ def build_period_comparison(by_cluster_date: dict, anchor: date) -> dict:
     return clusters_out
 
 
-def build_series(by_cluster_date: dict, anchor: date) -> tuple[list[str], dict]:
+def build_series(by_cluster_date: dict, anchor: date, metrics: list[str] = METRICS) -> tuple[list[str], dict]:
     series_dates = [
         (anchor - timedelta(days=offset)).isoformat()
         for offset in range(SERIES_DAYS - 1, -1, -1)
@@ -121,7 +136,7 @@ def build_series(by_cluster_date: dict, anchor: date) -> tuple[list[str], dict]:
     series_out = {}
     for cluster, date_map in by_cluster_date.items():
         metric_series = {}
-        for metric in METRICS:
+        for metric in metrics:
             values = []
             for d in series_dates:
                 row = date_map.get(d)
@@ -131,22 +146,33 @@ def build_series(by_cluster_date: dict, anchor: date) -> tuple[list[str], dict]:
     return series_dates, series_out
 
 
-def aggregate(records: list[dict]) -> dict:
+def aggregate(records: list[dict], group_field: str = "cluster", metrics: list[str] = METRICS) -> dict:
+    """
+    `group_field`/`metrics` let this same function build either the
+    cluster-level result (group_field="cluster", METRICS -- the original/
+    default behaviour, unchanged) or the Yulu-Centre-wise result
+    (group_field="yulu_centre", CENTRE_METRICS). The output dict's
+    "clusters" key is really just "records keyed by whatever group_field
+    was" in both cases -- kept as "clusters" even for the centre-wise
+    call so the shape matches what the existing dashboard already expects
+    at the top level; the centre-wise result is nested under its own
+    "by_centre" key instead of replacing anything (see main()).
+    """
     dates = sorted({r["date"] for r in records if r.get("date")})
     if not dates:
         return {"anchor_date": None, "days_captured": 0, "clusters": {}, "dates": [], "series": {}}
 
     anchor = date.fromisoformat(dates[-1])
 
-    by_cluster_date: dict[str, dict[str, dict]] = {}
+    by_group_date: dict[str, dict[str, dict]] = {}
     for r in records:
-        d, c = r.get("date"), r.get("cluster")
-        if not d or not c:
+        d, g = r.get("date"), r.get(group_field)
+        if not d or not g:
             continue
-        by_cluster_date.setdefault(c, {})[d] = r
+        by_group_date.setdefault(g, {})[d] = r
 
-    clusters_out = build_period_comparison(by_cluster_date, anchor)
-    series_dates, series_out = build_series(by_cluster_date, anchor)
+    clusters_out = build_period_comparison(by_group_date, anchor, metrics)
+    series_dates, series_out = build_series(by_group_date, anchor, metrics)
 
     return {
         "anchor_date": dates[-1],
@@ -159,23 +185,40 @@ def aggregate(records: list[dict]) -> dict:
 
 def main():
     try:
-        records = fetch_rows()
+        records = fetch_rows(SHEET_TAB)
         print(f"Fetched {len(records)} row(s) from '{SHEET_TAB}'.")
     except Exception as e:
         print(f"WARNING: could not fetch '{SHEET_TAB}' ({e}); writing an empty data.js")
         records = []
 
     result = aggregate(records)
+
+    # Yulu-Centre-wise fulfillment view -- a separate, additive top-level
+    # key. Fetched/aggregated independently so a problem here (e.g. the
+    # tab doesn't exist yet on a fresh deploy) never blocks the existing
+    # cluster-level data above.
+    try:
+        centre_records = fetch_rows(BYCENTRE_SHEET_TAB)
+        print(f"Fetched {len(centre_records)} row(s) from '{BYCENTRE_SHEET_TAB}'.")
+    except Exception as e:
+        print(f"WARNING: could not fetch '{BYCENTRE_SHEET_TAB}' ({e}); by_centre will be empty")
+        centre_records = []
+
+    result["by_centre"] = aggregate(centre_records, group_field="yulu_centre", metrics=CENTRE_METRICS)
+
     with open("data.js", "w", encoding="utf-8") as f:
         f.write("window.OPS_DATA = ")
         json.dump(result, f, indent=2)
         f.write(";\n")
 
+    by_centre = result["by_centre"]
     print(
         f"Wrote data.js — anchor_date={result.get('anchor_date')}, "
         f"days_captured={result.get('days_captured')}, "
         f"{len(result.get('clusters', {}))} cluster(s), "
-        f"{len(result.get('dates', []))} series date(s)."
+        f"{len(result.get('dates', []))} series date(s); "
+        f"by_centre: {len(by_centre.get('clusters', {}))} centre(s), "
+        f"{by_centre.get('days_captured', 0)} day(s) captured."
     )
 
 
