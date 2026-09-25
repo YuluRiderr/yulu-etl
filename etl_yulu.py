@@ -1187,20 +1187,22 @@ def _compute_daily_ops_rows_by_centre_for_date(token_day: pd.DataFrame, report_d
 def _prep_demand_df(demand_df: pd.DataFrame) -> pd.DataFrame:
     """
     Filters Demand Metrics (card 12245) to BLR and renames cluster_name ->
-    cluster. FIX: previously this unconditionally DROPPED every row with
-    a blank/null cluster_name via `.notna()` -- but a blank dimension
-    value in an otherwise per-cluster breakdown is the classic signature
-    of a GROUP BY ROLLUP/CUBE grand-total row. If Demand Metrics provides
-    one, it's the ONLY way to get a genuinely correct city-wide DAU (a
-    real distinct-user count) — this card is already pre-aggregated per
-    cluster, so there's no user-level data left on our side to dedupe
-    from once it's fetched. Relabeling that row as BLR_TOTAL_LABEL
-    (instead of discarding it) lets _compute_daily_ops_rows_for_date()
-    use it directly when present, falling back to the old (overcounting)
-    per-cluster sum only when no such row exists for that date.
+    cluster. Drops rows with a blank/null cluster_name.
+
+    REVERTED: a prior version of this function relabeled a blank
+    cluster_name row as BLR_TOTAL_LABEL instead of dropping it, on the
+    theory that it was a genuine GROUP BY ROLLUP grand-total row from
+    Metabase. That theory was never actually confirmed against real data
+    and turned out to be wrong -- in production it picked up some other,
+    much smaller unrelated bucket (e.g. unclustered/unassigned rows), not
+    a real city-wide total, and silently replaced a correct-looking
+    number with a nonsense one. Back to the simple, confirmed-correct
+    definition: BLR (Total) DAU is the sum of every cluster's DAU (see
+    _compute_daily_ops_rows_for_date) -- rows with no cluster_name at all
+    aren't part of any cluster's total and are just dropped.
     """
     demand_df = demand_df[demand_df["city_code"] == CITY].copy()
-    demand_df["cluster_name"] = demand_df["cluster_name"].fillna(BLR_TOTAL_LABEL)
+    demand_df = demand_df[demand_df["cluster_name"].notna()].copy()
     return demand_df.rename(columns={"cluster_name": "cluster"})
 
 
@@ -1235,43 +1237,29 @@ def _compute_daily_ops_rows_for_date(demand_day: pd.DataFrame, token_day: pd.Dat
     cluster and day (no direct link between the two token types exists in
     the data, so this is a same-user/same-cluster/same-day proxy).
 
-    BLR total row: every metric also gets a synthetic "BLR (Total)" row —
-    RECOMPUTED across the whole city, not a sum/average of the per-cluster
-    rows (fulfillment%/TAT/productivity don't aggregate linearly — e.g.
-    city-wide fulfillment% is closed÷total across ALL BLR tokens, not the
-    mean of each cluster's %). Implemented by duplicating each city's
-    already-BLR-filtered rows under the label BLR_TOTAL_LABEL before the
-    per-cluster groupby, so the exact same aggregation code produces both
-    the per-cluster rows and the city-total row in one pass.
+    BLR total row: every metric except DAU gets a synthetic "BLR (Total)"
+    row RECOMPUTED across the whole city, not a sum/average of the
+    per-cluster rows (fulfillment%/TAT/productivity don't aggregate
+    linearly — e.g. city-wide fulfillment% is closed÷total across ALL BLR
+    tokens, not the mean of each cluster's %). Implemented by duplicating
+    each city's already-BLR-filtered rows under the label BLR_TOTAL_LABEL
+    before the per-cluster groupby, so the exact same aggregation code
+    produces both the per-cluster rows and the city-total row in one pass.
+    DAU is the one exception, by confirmed definition: BLR (Total) DAU is
+    the plain SUM of every cluster's own DAU, not a recompute.
 
     Every input is assumed already hard-filtered to city == "BLR" by the
     caller — no other city's rows should ever reach this function.
     """
+    # BLR (Total) DAU = sum of every cluster's DAU (confirmed definition;
+    # see _prep_demand_df's docstring for the alternate "genuine dedup'd
+    # total row" approach that was tried and reverted after it produced a
+    # wrong, much-too-small number in production).
     base = demand_day[["cluster", "dau"]].copy()
-    if (base["cluster"] == BLR_TOTAL_LABEL).any():
-        # The caller already relabeled a blank/null cluster_name row (the
-        # classic signature of a GROUP BY ROLLUP grand-total row) as
-        # BLR_TOTAL_LABEL -- Demand Metrics is providing its OWN
-        # already-deduplicated city-wide DAU directly. Use it as-is.
-        pass
-    else:
-        # FIX: no genuine total row available from the source for this
-        # date -- fall back to summing per-cluster DAU. This OVERCOUNTS
-        # any user active in more than one cluster the same day, since
-        # DAU is inherently a distinct-user count, not additive across
-        # clusters (confirmed as a real bug: this used to be the ONLY
-        # path, unconditionally, even on dates where Metabase did supply
-        # a real total). Flagged loudly so the limitation is visible in
-        # the run log instead of silently producing an inflated BLR
-        # (Total) DAU forever.
-        print(f"  WARNING: Demand Metrics has no genuine city-wide total row for "
-              f"{report_date} -- BLR (Total) DAU falls back to summing per-cluster "
-              f"values, which OVERCOUNTS users active in more than one cluster "
-              f"that day.")
-        base = pd.concat(
-            [pd.DataFrame([{"cluster": BLR_TOTAL_LABEL, "dau": base["dau"].sum()}]), base],
-            ignore_index=True,
-        )
+    base = pd.concat(
+        [pd.DataFrame([{"cluster": BLR_TOTAL_LABEL, "dau": base["dau"].sum()}]), base],
+        ignore_index=True,
+    )
 
     # Duplicate every BLR row under BLR_TOTAL_LABEL so the same per-cluster
     # groupby logic below also produces a genuine whole-city aggregate row.
