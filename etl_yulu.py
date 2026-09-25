@@ -1187,22 +1187,21 @@ def _compute_daily_ops_rows_by_centre_for_date(token_day: pd.DataFrame, report_d
 def _prep_demand_df(demand_df: pd.DataFrame) -> pd.DataFrame:
     """
     Filters Demand Metrics (card 12245) to BLR and renames cluster_name ->
-    cluster. Drops rows with a blank/null cluster_name.
-
-    REVERTED: a prior version of this function relabeled a blank
-    cluster_name row as BLR_TOTAL_LABEL instead of dropping it, on the
-    theory that it was a genuine GROUP BY ROLLUP grand-total row from
-    Metabase. That theory was never actually confirmed against real data
-    and turned out to be wrong -- in production it picked up some other,
-    much smaller unrelated bucket (e.g. unclustered/unassigned rows), not
-    a real city-wide total, and silently replaced a correct-looking
-    number with a nonsense one. Back to the simple, confirmed-correct
-    definition: BLR (Total) DAU is the sum of every cluster's DAU (see
-    _compute_daily_ops_rows_for_date) -- rows with no cluster_name at all
-    aren't part of any cluster's total and are just dropped.
+    cluster. Unlike an earlier version of this function, does NOT drop
+    rows with a blank/null/"None" cluster_name here -- confirmed live
+    that such rows are real, non-trivial demand with no cluster
+    attribution (e.g. unclustered/unassigned reservations), NOT
+    negligible junk and NOT a special "grand total" row either (a
+    previous "fix" wrongly assumed the latter and was reverted). They
+    still belong in BLR (Total) DAU -- "total" means literally everything
+    for that date -- they're just excluded from the per-cluster
+    breakdown by _compute_daily_ops_rows_for_date() since there's no
+    cluster to attribute them to. A literal "None" string (as opposed to
+    a true empty/NaN cell) is normalised to NaN here too, since Metabase
+    has been observed writing nulls both ways depending on the export path.
     """
     demand_df = demand_df[demand_df["city_code"] == CITY].copy()
-    demand_df = demand_df[demand_df["cluster_name"].notna()].copy()
+    demand_df["cluster_name"] = demand_df["cluster_name"].replace({"None": None, "none": None, "": None})
     return demand_df.rename(columns={"cluster_name": "cluster"})
 
 
@@ -1251,13 +1250,17 @@ def _compute_daily_ops_rows_for_date(demand_day: pd.DataFrame, token_day: pd.Dat
     Every input is assumed already hard-filtered to city == "BLR" by the
     caller — no other city's rows should ever reach this function.
     """
-    # BLR (Total) DAU = sum of every cluster's DAU (confirmed definition;
-    # see _prep_demand_df's docstring for the alternate "genuine dedup'd
-    # total row" approach that was tried and reverted after it produced a
-    # wrong, much-too-small number in production).
-    base = demand_day[["cluster", "dau"]].copy()
+    # BLR (Total) DAU = sum of EVERY row for the date, including any with
+    # no cluster attribution at all (confirmed live: unclustered/
+    # unassigned demand is real and non-trivial, not junk -- "total"
+    # means literally everything). The per-cluster breakdown below only
+    # uses rows that DO have a cluster name, since there's nothing
+    # sensible to label an unclustered row with.
+    demand_all_rows = demand_day[["cluster", "dau"]].copy()
+    total_dau = demand_all_rows["dau"].sum()
+    base = demand_all_rows[demand_all_rows["cluster"].notna()].copy()
     base = pd.concat(
-        [pd.DataFrame([{"cluster": BLR_TOTAL_LABEL, "dau": base["dau"].sum()}]), base],
+        [pd.DataFrame([{"cluster": BLR_TOTAL_LABEL, "dau": total_dau}]), base],
         ignore_index=True,
     )
 
