@@ -124,6 +124,14 @@ CARD_ID_WAREHOUSE = 6214
 CARD_ID_DEMAND_METRICS = 12245   # demand-metrics-blr (already BLR-scoped)
 CARD_ID_TOKEN_FLOW     = 11765   # token-flow-blr (already BLR-scoped)
 CARD_ID_MECH_FLOW      = 8966    # mechanic-flow-testing (multi-city; filtered to BLR here)
+# aggregate-for-percentage -- Metabase's own purpose-built USER-level
+# fulfillment% aggregate, per (checkin_date, yz_name/station), with its
+# own "cluster" column. Per explicit instruction: user-level fulfillment%
+# (service_swap + attachment) is sourced from THIS card instead of being
+# derived from raw Token Flow rows; token-level fulfillment%/TAT stay
+# sourced from Token Flow (11765) as before -- this card has no
+# token-level breakdown. See _agg_pct_user_fulfillment().
+CARD_ID_AGG_PCT_USER   = 13490
 
 # BLR-only scope
 CITY = "BLR"
@@ -177,6 +185,8 @@ DAILY_OPS_STR_COLS = {
     "phone_number", "bike_name", "username", "role", "display_name",
     "sub_role", "start_cluster", "primary_role", "QC pass/fail",
     "task_status", "task_type",
+    # aggregate-for-percentage (card 13490)
+    "yz_name",
 }
 
 # "Bikes in Warehouse" card (6214) actually returns these columns.
@@ -1142,11 +1152,59 @@ def _token_fulfillment_metrics(token_df: pd.DataFrame, type_value: str,
     return out.reset_index()[cols]
 
 
-def _compute_daily_ops_rows_by_centre_for_date(token_day: pd.DataFrame, report_date: str) -> pd.DataFrame:
+# card 13490's native grain, kept around so an empty/missing fetch still
+# gives downstream code the columns it expects instead of KeyError-ing.
+_AGG_DAY_EMPTY_COLS = ["cluster", "yz_name", "checkin_date",
+                       "service_swap_users_considered", "service_swap_users_fulfilled",
+                       "attach_users_considered", "attach_users_fulfilled"]
+
+
+def _agg_pct_user_fulfillment(agg_day: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    """
+    User-level fulfillment% for service_swap and Attach, sourced directly
+    from card 13490 ("aggregate-for-percentage" -- Metabase's own
+    purpose-built aggregate for this exact number) instead of derived
+    from raw Token Flow rows, per explicit instruction. Token-level
+    fulfillment%/TAT stay sourced from Token Flow (_token_fulfillment_metrics)
+    as before -- 13490 has no token-level breakdown.
+
+    13490's native grain is per (checkin_date, yz_name/station), with its
+    own "cluster" column already mapping each station to a cluster.
+    `group_col="cluster"` sums considered/fulfilled across every station
+    in that cluster then recomputes pct (summing counts and recomputing
+    is correct here, unlike averaging percentages); `group_col="yz_name"`
+    is this card's own native grain, used by the byCentre tab.
+    """
+    cols = [group_col, "service_swap_fulfillment_pct_user", "attachment_fulfillment_pct_user"]
+    if agg_day.empty or group_col not in agg_day.columns:
+        return pd.DataFrame(columns=cols)
+
+    grouped = agg_day.groupby(group_col).agg(
+        service_swap_considered=("service_swap_users_considered", "sum"),
+        service_swap_fulfilled=("service_swap_users_fulfilled", "sum"),
+        attach_considered=("attach_users_considered", "sum"),
+        attach_fulfilled=("attach_users_fulfilled", "sum"),
+    )
+
+    grouped["service_swap_fulfillment_pct_user"] = grouped.apply(
+        lambda r: round(100 * r["service_swap_fulfilled"] / r["service_swap_considered"], 1)
+        if r["service_swap_considered"] else None, axis=1)
+    grouped["attachment_fulfillment_pct_user"] = grouped.apply(
+        lambda r: round(100 * r["attach_fulfilled"] / r["attach_considered"], 1)
+        if r["attach_considered"] else None, axis=1)
+
+    return grouped.reset_index()[cols]
+
+
+def _compute_daily_ops_rows_by_centre_for_date(token_day: pd.DataFrame, agg_day: pd.DataFrame,
+                                                report_date: str) -> pd.DataFrame:
     """
     Same fulfillment%/TAT math as the cluster-level Daily Ops Metrics
     (_token_fulfillment_metrics — identical implementation, just grouped
-    by yc_name, the individual Yulu Centre/station, instead of cluster).
+    by yc_name, the individual Yulu Centre/station, instead of cluster) --
+    EXCEPT user-level fulfillment%, which is sourced from card 13490
+    instead (_agg_pct_user_fulfillment, group_col="yz_name" -- this tab's
+    own native grain), per the same instruction as the cluster-level tab.
 
     Only service_swap/attachment fulfillment%+TAT are reported at this
     granularity — DAU and mechanic productivity are NOT, because neither
@@ -1176,6 +1234,16 @@ def _compute_daily_ops_rows_by_centre_for_date(token_day: pd.DataFrame, report_d
     attach_metrics = _token_fulfillment_metrics(token_df, "Attach", "attachment", group_col="centre")
 
     result = swap_metrics.merge(attach_metrics, on="centre", how="outer")
+
+    agg_df = agg_day.rename(columns={"yz_name": "centre"}) if not agg_day.empty else agg_day
+    if agg_df is not None and not agg_df.empty:
+        agg_df = agg_df[agg_df["centre"].notna() & (agg_df["centre"].astype(str).str.strip() != "")]
+        agg_df = pd.concat([agg_df, agg_df.assign(centre=BLR_TOTAL_LABEL)], ignore_index=True)
+    agg_user_pct = _agg_pct_user_fulfillment(agg_df, "centre")
+
+    result = result.drop(columns=["service_swap_fulfillment_pct_user", "attachment_fulfillment_pct_user"])
+    result = result.merge(agg_user_pct, on="centre", how="outer")
+
     result = result.rename(columns={"centre": "yulu_centre"})
     result.insert(1, "date", report_date)
     for col in DAILY_OPS_BYCENTRE_COLS_ORDER:
@@ -1206,7 +1274,8 @@ def _prep_demand_df(demand_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _compute_daily_ops_rows_for_date(demand_day: pd.DataFrame, token_day: pd.DataFrame,
-                                      mech_day: pd.DataFrame, report_date: str) -> pd.DataFrame:
+                                      mech_day: pd.DataFrame, agg_day: pd.DataFrame,
+                                      report_date: str) -> pd.DataFrame:
     """
     Pure per-date computation, shared by BOTH the daily STEP F run
     (process_daily_ops_metrics — each input already scoped to exactly one
@@ -1217,8 +1286,10 @@ def _compute_daily_ops_rows_for_date(demand_day: pd.DataFrame, token_day: pd.Dat
 
     One row per BLR cluster for `report_date`, combining:
       - dau                                               (Demand Metrics, 12245)
-      - service_swap fulfillment% (user/token) + TAT      (Token Flow, 11765)
-      - attachment fulfillment% (user/token) + TAT         (Token Flow, 11765)
+      - service_swap fulfillment% (token) + TAT           (Token Flow, 11765)
+      - service_swap fulfillment% (user)                  (aggregate-for-percentage, 13490)
+      - attachment fulfillment% (token) + TAT              (Token Flow, 11765)
+      - attachment fulfillment% (user)                     (aggregate-for-percentage, 13490)
       - mechanic productivity, mechanics >90 days old       (Mechanic Flow, 8966)
       - enquiry_total + enquiry->attachment%                (Token Flow, 11765)
 
@@ -1350,6 +1421,21 @@ def _compute_daily_ops_rows_for_date(demand_day: pd.DataFrame, token_day: pd.Dat
     result = result.merge(productivity, on="cluster", how="left")
     result = result.merge(enquiry_summary, on="cluster", how="left")
 
+    # User-level fulfillment% (service_swap + attachment) is sourced from
+    # card 13490 instead of the token_df-derived values just merged in
+    # above -- per explicit instruction. Token-level fulfillment%/TAT from
+    # swap_metrics/attach_metrics are kept as-is. agg_df duplicates every
+    # row under BLR_TOTAL_LABEL first, same rollup pattern as token_df
+    # above, so the same _agg_pct_user_fulfillment() call produces both
+    # the per-cluster and city-total figures.
+    agg_df = (
+        pd.concat([agg_day, agg_day.assign(cluster=BLR_TOTAL_LABEL)], ignore_index=True)
+        if not agg_day.empty else agg_day
+    )
+    agg_user_pct = _agg_pct_user_fulfillment(agg_df, "cluster")
+    result = result.drop(columns=["service_swap_fulfillment_pct_user", "attachment_fulfillment_pct_user"])
+    result = result.merge(agg_user_pct, on="cluster", how="left")
+
     # No eligible mechanics (Maintenance, DOJ > 90d) for a cluster that day
     # reads as 0 productivity, not blank — confirmed explicitly.
     result["mechanic_productivity_90d"] = result["mechanic_productivity_90d"].fillna(0)
@@ -1399,17 +1485,17 @@ def process_daily_ops_metrics(gc: gspread.Client):
     print(f"\n── STEP F: Daily Ops Metrics ({start_date} -> {end_date}, "
           f"{DAILY_OPS_REFRESH_WINDOW_DAYS}-day rolling refresh) ──")
 
-    # The 3 cards are completely independent of each other (different
+    # The 4 cards are completely independent of each other (different
     # report IDs, no shared state) -- fetched concurrently instead of one
     # after another so the wall-clock cost is however long the SLOWEST of
-    # the three takes (Mechanic Flow Testing, usually), not the sum of
-    # all three. Each thread calls fetch_metabase_csv_range() as-is, which
+    # the four takes (Mechanic Flow Testing, usually), not the sum of
+    # all four. Each thread calls fetch_metabase_csv_range() as-is, which
     # authenticates its own Metabase session internally -- a few extra
     # auth round-trips is a non-issue next to the time this actually saves.
     # ONE range fetch per card covers the whole window -- not one fetch
     # per day -- then each date is sliced out of it locally below, same
     # pattern as the backfill's per-month fetch already uses.
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         demand_future = pool.submit(
             fetch_metabase_csv_range, CARD_ID_DEMAND_METRICS, start_date, end_date,
             force_str_cols=DAILY_OPS_STR_COLS)
@@ -1419,13 +1505,28 @@ def process_daily_ops_metrics(gc: gspread.Client):
         mech_future = pool.submit(
             fetch_metabase_csv_range, CARD_ID_MECH_FLOW, start_date, end_date,
             force_str_cols=DAILY_OPS_STR_COLS)
+        agg_future = pool.submit(
+            fetch_metabase_csv_range, CARD_ID_AGG_PCT_USER, start_date, end_date,
+            force_str_cols=DAILY_OPS_STR_COLS)
         demand_all = demand_future.result()
         token_all = token_future.result()
         mech_all = mech_future.result()
+        agg_all = agg_future.result()
 
     demand_all = _prep_demand_df(demand_all)
 
     token_all = token_all[token_all["city"] == CITY].copy() if not token_all.empty else token_all
+
+    if not agg_all.empty and "checkin_date" in agg_all.columns:
+        # checkin_date's exact string format from this card hasn't been
+        # confirmed to match the plain "YYYY-MM-DD" used elsewhere --
+        # normalise explicitly rather than assume, so a format mismatch
+        # fails loudly (all dates silently unmatched) instead of not at all.
+        agg_all["checkin_date"] = pd.to_datetime(agg_all["checkin_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    elif not agg_all.empty:
+        print(f"  WARNING: card {CARD_ID_AGG_PCT_USER} response is missing 'checkin_date' -- "
+              f"user-level fulfillment% will be blank for this run.")
+        agg_all = pd.DataFrame(columns=_AGG_DAY_EMPTY_COLS)
 
     if not mech_all.empty:
         mech_all = mech_all[mech_all["city"] == CITY].copy()
@@ -1464,7 +1565,12 @@ def process_daily_ops_metrics(gc: gspread.Client):
             mech_day["days_old"] = mech_day["date_of_joining"].map(
                 lambda d: (report_dt - d).days if pd.notna(d) else None)
 
-        result = _compute_daily_ops_rows_for_date(demand_day, token_day, mech_day, report_date)
+        agg_day = (
+            pd.DataFrame(columns=_AGG_DAY_EMPTY_COLS) if agg_all.empty
+            else agg_all[agg_all["checkin_date"] == report_date].copy()
+        )
+
+        result = _compute_daily_ops_rows_for_date(demand_day, token_day, mech_day, agg_day, report_date)
 
         delete_rows_for_date_and_append(
             gc, MASTER_SHEET_ID, DAILY_OPS_SHEET_TAB, result,
@@ -1475,7 +1581,7 @@ def process_daily_ops_metrics(gc: gspread.Client):
         # rolling-window recompute, reusing this date's already-fetched
         # token_day (no extra Metabase call). Written independently of the
         # cluster-level tab above so a hiccup in one never blocks the other.
-        by_centre_result = _compute_daily_ops_rows_by_centre_for_date(token_day, report_date)
+        by_centre_result = _compute_daily_ops_rows_by_centre_for_date(token_day, agg_day, report_date)
         if not by_centre_result.empty:
             delete_rows_for_date_and_append(
                 gc, MASTER_SHEET_ID, DAILY_OPS_BYCENTRE_SHEET_TAB, by_centre_result,
@@ -1608,7 +1714,7 @@ _MECH_DAY_EMPTY_COLS = ["primary_role", "days_old", "QC pass/fail",
 def compute_daily_ops_metrics_range(start_date: str, end_date: str) -> dict[str, pd.DataFrame]:
     """
     Computes Daily Ops Metrics for EVERY date in [start_date, end_date],
-    fetching each of the 3 Metabase cards ONCE for the whole range
+    fetching each of the 4 Metabase cards ONCE for the whole range
     (month-chunked, closed months cached — see _fetch_daily_ops_source_range),
     then looping locally per date and calling
     _compute_daily_ops_rows_for_date() — the exact same math
@@ -1619,14 +1725,14 @@ def compute_daily_ops_metrics_range(start_date: str, end_date: str) -> dict[str,
     """
     print(f"\n── Daily Ops Metrics backfill: {start_date} -> {end_date} ──")
 
-    # Same reasoning as process_daily_ops_metrics(): these 3 sources are
+    # Same reasoning as process_daily_ops_metrics(): these 4 sources are
     # independent, so fetch them concurrently rather than one after
     # another. Each is already internally month-chunked with its own
-    # cache namespace ("demand"/"token_flow"/"mech_flow" -- distinct
-    # filenames, so no collision between threads writing cache files at
-    # the same time), so this just overlaps three already-optimized
-    # fetches instead of running them back to back.
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    # cache namespace ("demand"/"token_flow"/"mech_flow"/"agg_pct_user" --
+    # distinct filenames, so no collision between threads writing cache
+    # files at the same time), so this just overlaps four already-
+    # optimized fetches instead of running them back to back.
+    with ThreadPoolExecutor(max_workers=4) as pool:
         demand_future = pool.submit(
             _fetch_daily_ops_source_range, CARD_ID_DEMAND_METRICS, "demand",
             start_date, end_date, DAILY_OPS_STR_COLS)
@@ -1636,9 +1742,13 @@ def compute_daily_ops_metrics_range(start_date: str, end_date: str) -> dict[str,
         mech_future = pool.submit(
             _fetch_daily_ops_source_range, CARD_ID_MECH_FLOW, "mech_flow",
             start_date, end_date, DAILY_OPS_STR_COLS)
+        agg_future = pool.submit(
+            _fetch_daily_ops_source_range, CARD_ID_AGG_PCT_USER, "agg_pct_user",
+            start_date, end_date, DAILY_OPS_STR_COLS)
         demand_all = demand_future.result()
         token_all = token_future.result()
         mech_all = mech_future.result()
+        agg_all = agg_future.result()
 
     if demand_all.empty:
         print("  WARNING: no Demand Metrics data for the whole range — nothing to compute.")
@@ -1646,6 +1756,13 @@ def compute_daily_ops_metrics_range(start_date: str, end_date: str) -> dict[str,
     demand_all = _prep_demand_df(demand_all)
 
     token_all = token_all[token_all["city"] == CITY].copy() if not token_all.empty else token_all
+
+    if not agg_all.empty and "checkin_date" in agg_all.columns:
+        agg_all["checkin_date"] = pd.to_datetime(agg_all["checkin_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    elif not agg_all.empty:
+        print(f"  WARNING: card {CARD_ID_AGG_PCT_USER} response is missing 'checkin_date' -- "
+              f"user-level fulfillment% will be blank for this backfill.")
+        agg_all = pd.DataFrame(columns=_AGG_DAY_EMPTY_COLS)
 
     if not mech_all.empty:
         mech_all = mech_all[mech_all["city"] == CITY].copy()
@@ -1677,7 +1794,12 @@ def compute_daily_ops_metrics_range(start_date: str, end_date: str) -> dict[str,
             mech_day["days_old"] = mech_day["date_of_joining"].map(
                 lambda dd: (report_dt - dd).days if pd.notna(dd) else None)
 
-        day_result = _compute_daily_ops_rows_for_date(demand_day, token_day, mech_day, d)
+        agg_day = (
+            pd.DataFrame(columns=_AGG_DAY_EMPTY_COLS) if agg_all.empty
+            else agg_all[agg_all["checkin_date"] == d].copy()
+        )
+
+        day_result = _compute_daily_ops_rows_for_date(demand_day, token_day, mech_day, agg_day, d)
         if not day_result.empty:
             results[d] = day_result
             print(f"    {d}: {len(day_result)} row(s) computed.")
