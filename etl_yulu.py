@@ -1711,7 +1711,7 @@ _MECH_DAY_EMPTY_COLS = ["primary_role", "days_old", "QC pass/fail",
                          "live_repair_flag", "user_id", "bike_name", "start_cluster"]
 
 
-def compute_daily_ops_metrics_range(start_date: str, end_date: str) -> dict[str, pd.DataFrame]:
+def compute_daily_ops_metrics_range(start_date: str, end_date: str) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     """
     Computes Daily Ops Metrics for EVERY date in [start_date, end_date],
     fetching each of the 4 Metabase cards ONCE for the whole range
@@ -1720,8 +1720,13 @@ def compute_daily_ops_metrics_range(start_date: str, end_date: str) -> dict[str,
     _compute_daily_ops_rows_for_date() — the exact same math
     process_daily_ops_metrics() uses for a single day, just fed from a
     date-filtered slice of the bulk fetch instead of a fresh Metabase call
-    per day. Returns {date: DataFrame} for every date with at least some
-    Demand Metrics data; the caller decides which dates to actually write.
+    per day. Returns a tuple of two {date: DataFrame} dicts -- cluster-level
+    results and Yulu-Centre-wise (byCentre) results -- for every date with
+    at least some Demand Metrics data; the caller decides which dates to
+    actually write. Previously the byCentre tab was daily-only with no
+    backfill path at all; this reuses the same per-date token_day/agg_day
+    slices already being computed for the cluster-level result, so the
+    backfill covers both tabs at no extra Metabase-fetch cost.
     """
     print(f"\n── Daily Ops Metrics backfill: {start_date} -> {end_date} ──")
 
@@ -1752,7 +1757,7 @@ def compute_daily_ops_metrics_range(start_date: str, end_date: str) -> dict[str,
 
     if demand_all.empty:
         print("  WARNING: no Demand Metrics data for the whole range — nothing to compute.")
-        return {}
+        return {}, {}
     demand_all = _prep_demand_df(demand_all)
 
     token_all = token_all[token_all["city"] == CITY].copy() if not token_all.empty else token_all
@@ -1778,6 +1783,7 @@ def compute_daily_ops_metrics_range(start_date: str, end_date: str) -> dict[str,
     print(f"  {len(dates_in_range)} date(s) with Demand Metrics data in range.")
 
     results: dict[str, pd.DataFrame] = {}
+    by_centre_results: dict[str, pd.DataFrame] = {}
     for d in dates_in_range:
         demand_day = demand_all[demand_all["date"] == d]
 
@@ -1804,41 +1810,31 @@ def compute_daily_ops_metrics_range(start_date: str, end_date: str) -> dict[str,
             results[d] = day_result
             print(f"    {d}: {len(day_result)} row(s) computed.")
 
-    return results
+        by_centre_result = _compute_daily_ops_rows_by_centre_for_date(token_day, agg_day, d)
+        if not by_centre_result.empty:
+            by_centre_results[d] = by_centre_result
+
+    return results, by_centre_results
 
 
-def refresh_daily_ops_metrics_range(gc: gspread.Client, start_date: str, end_date: str,
-                                     overwrite: bool = False) -> None:
+def _write_backfill_range_to_tab(ss, tab: str, cols_order: list[str], results: dict[str, pd.DataFrame],
+                                  start_date: str, end_date: str, overwrite: bool) -> None:
     """
-    Backfills 'Daily_Ops_Metrics' for [start_date, end_date]. Unlike the
-    daily run (which delete-then-appends exactly one day, so it can safely
-    re-run today's row), this is normally a fill-the-gaps job: existing
-    dates are read once up front and skipped, and every new date's rows
-    are appended in ONE batch write at the end — appropriate for a wide
-    historical range where a per-date Sheets round-trip would be far
-    slower than the Metabase fetch itself.
-
-    overwrite=True switches this to a full recompute: every existing row
-    whose date falls in [start_date, end_date] is deleted first (whatever
-    it currently says), then the ENTIRE range is recomputed fresh and
-    appended — not just the gaps. Use this after a correctness fix to the
-    per-date math itself (e.g. a metric's date-bucketing changed) so
-    already-backfilled history actually picks up the fix, since the
-    default fill-the-gaps mode would otherwise skip every date that's
-    already present and leave its old, wrong values untouched forever.
+    Shared fill-gaps/overwrite writer for a Daily Ops Metrics style tab
+    (date always in column B) -- used for BOTH the cluster-level
+    'Daily_Ops_Metrics' tab and the Yulu-Centre-wise
+    'Daily_Ops_Metrics_ByCentre' tab, so a backfill covers both from one
+    call instead of duplicating this read-existing-dates/delete/append
+    logic per tab. See refresh_daily_ops_metrics_range()'s docstring for
+    the fill-gaps vs overwrite semantics.
     """
-    print(f"\n── Daily Ops Metrics BACKFILL: {start_date} -> {end_date} "
-          f"({'OVERWRITE' if overwrite else 'fill gaps'}) ──")
-
-    ss = gc.open_by_key(MASTER_SHEET_ID)
     try:
-        ws = ss.worksheet(DAILY_OPS_SHEET_TAB)
+        ws = ss.worksheet(tab)
         raw_date_vals = [v for v in ws.col_values(2)[1:] if v]  # column B = date
     except gspread.exceptions.WorksheetNotFound:
-        print(f"  '{DAILY_OPS_SHEET_TAB}' does not exist yet — creating it...")
-        ws = ss.add_worksheet(
-            title=DAILY_OPS_SHEET_TAB, rows=1000, cols=max(len(DAILY_OPS_COLS_ORDER) + 2, 10))
-        ws.append_row(DAILY_OPS_COLS_ORDER, value_input_option="RAW")
+        print(f"  '{tab}' does not exist yet — creating it...")
+        ws = ss.add_worksheet(title=tab, rows=1000, cols=max(len(cols_order) + 2, 10))
+        ws.append_row(cols_order, value_input_option="RAW")
         raw_date_vals = []
 
     all_possible_dates = []
@@ -1875,7 +1871,7 @@ def refresh_daily_ops_metrics_range(gc: gspread.Client, start_date: str, end_dat
                 ]
             }
             ss.batch_update(delete_requests)
-            print(f"  Overwrite mode: deleted {len(rows_to_delete)} existing row(s) in range "
+            print(f"  '{tab}' overwrite mode: deleted {len(rows_to_delete)} existing row(s) in range "
                   f"before recomputing — every date will be rewritten fresh.")
         existing_dates = set()
     elif overwrite:
@@ -1884,19 +1880,55 @@ def refresh_daily_ops_metrics_range(gc: gspread.Client, start_date: str, end_dat
         existing_dates = {
             d for d in all_possible_dates if any(_matches_target_date(v, d) for v in raw_date_vals)
         } if raw_date_vals else set()
-        print(f"  '{DAILY_OPS_SHEET_TAB}' already has {len(existing_dates)} date(s) in range — those will be skipped.")
-
-    results = compute_daily_ops_metrics_range(start_date, end_date)
+        print(f"  '{tab}' already has {len(existing_dates)} date(s) in range — those will be skipped.")
 
     rows_to_write = [df for d, df in sorted(results.items()) if d not in existing_dates]
     if not rows_to_write:
-        print("  Nothing new to write — every date in range is already in the sheet.")
+        print(f"  '{tab}': nothing new to write — every date in range is already in the sheet.")
         return
 
     final_df = pd.concat(rows_to_write, ignore_index=True)
     values = clean_for_sheets(final_df)
     ws.append_rows(values, value_input_option="user_entered")
-    print(f"  Appended {len(values)} row(s) across {len(rows_to_write)} date(s) to '{DAILY_OPS_SHEET_TAB}'.")
+    print(f"  '{tab}': appended {len(values)} row(s) across {len(rows_to_write)} date(s).")
+
+
+def refresh_daily_ops_metrics_range(gc: gspread.Client, start_date: str, end_date: str,
+                                     overwrite: bool = False) -> None:
+    """
+    Backfills BOTH 'Daily_Ops_Metrics' (cluster-level) and
+    'Daily_Ops_Metrics_ByCentre' (Yulu-Centre-wise) for [start_date,
+    end_date] -- previously the byCentre tab had no backfill path at all
+    and only accumulated from whenever the daily run first wrote it, so
+    trailing-period columns (14-21 days ago, etc.) stayed blank for any
+    range this hadn't already covered. Unlike the daily run (which
+    delete-then-appends exactly one day, so it can safely re-run today's
+    row), this is normally a fill-the-gaps job: existing dates are read
+    once up front per tab and skipped, and every new date's rows are
+    appended in ONE batch write at the end — appropriate for a wide
+    historical range where a per-date Sheets round-trip would be far
+    slower than the Metabase fetch itself.
+
+    overwrite=True switches this to a full recompute: every existing row
+    whose date falls in [start_date, end_date] is deleted first (whatever
+    it currently says), then the ENTIRE range is recomputed fresh and
+    appended — not just the gaps. Use this after a correctness fix to the
+    per-date math itself (e.g. a metric's date-bucketing changed) so
+    already-backfilled history actually picks up the fix, since the
+    default fill-the-gaps mode would otherwise skip every date that's
+    already present and leave its old, wrong values untouched forever.
+    """
+    print(f"\n── Daily Ops Metrics BACKFILL: {start_date} -> {end_date} "
+          f"({'OVERWRITE' if overwrite else 'fill gaps'}) ──")
+
+    ss = gc.open_by_key(MASTER_SHEET_ID)
+    results, by_centre_results = compute_daily_ops_metrics_range(start_date, end_date)
+
+    _write_backfill_range_to_tab(
+        ss, DAILY_OPS_SHEET_TAB, DAILY_OPS_COLS_ORDER, results, start_date, end_date, overwrite)
+    _write_backfill_range_to_tab(
+        ss, DAILY_OPS_BYCENTRE_SHEET_TAB, DAILY_OPS_BYCENTRE_COLS_ORDER, by_centre_results,
+        start_date, end_date, overwrite)
 
 
 # ─────────────────────────────────────────────────────────────

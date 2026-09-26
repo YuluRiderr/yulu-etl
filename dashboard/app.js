@@ -46,7 +46,10 @@ const CENTRE_METRIC_TABS = [
 let ACTIVE_TAB = 0;
 let ACTIVE_CENTRE_TAB = 0;
 let ACTIVE_CLUSTER = BLR_TOTAL_LABEL;
-let ACTIVE_CLUSTERS_DATE = null; // resolved lazily in sectionClusters() -- defaults to the most recent captured date
+// "By Cluster" date RANGE -- both resolved lazily in sectionClusters()
+// (default: the single most recent captured date, i.e. a 1-day "range").
+let ACTIVE_CLUSTERS_START = null;
+let ACTIVE_CLUSTERS_END = null;
 const CHART_INSTANCES = [];
 
 function fmtDate(d) {
@@ -90,17 +93,27 @@ function series(cluster, metric) {
   return c[metric];
 }
 
-// Pulls a single day's value for an arbitrary captured date, by looking
-// it up in the daily series (DATA.dates/DATA.series) rather than the
-// named-period comparison object (which only has "latest"/"p0_7"/etc,
-// not any specific date) -- lets the "By Cluster" ranked view filter to
-// any day in DATA.dates, not just the newest one.
-function getForDate(cluster, metric, date) {
+// Averages a metric over [startDate, endDate] (inclusive) using the
+// daily series (DATA.dates/DATA.series) -- NOT the named-period
+// comparison object (which only has "latest"/"p0_7"/etc, never an
+// arbitrary range). A single-day range (startDate === endDate) just
+// returns that one day's value, so this covers both the old "pick one
+// date" behaviour and a true multi-day average. Dates with no row
+// (null) are skipped rather than treated as 0, same "average over
+// whatever was actually captured" rule build_data.py already uses for
+// the named periods.
+function getForRange(cluster, metric, startDate, endDate) {
   const dates = DATA.dates || [];
-  const idx = dates.indexOf(date);
-  if (idx === -1) return null;
-  const v = series(cluster, metric)[idx];
-  return (v === undefined) ? null : v;
+  const arr = series(cluster, metric);
+  const vals = [];
+  dates.forEach((d, i) => {
+    if (d >= startDate && d <= endDate) {
+      const v = arr[i];
+      if (v !== null && v !== undefined) vals.push(v);
+    }
+  });
+  if (!vals.length) return null;
+  return vals.reduce((a, b) => a + b, 0) / vals.length;
 }
 
 function kpiTile(label, value, unit, foot) {
@@ -356,38 +369,50 @@ function sectionClusters() {
   // -- otherwise the picker would list 60 trend-series days even though
   // Daily_Ops_Metrics itself has far fewer real rows captured so far.
   const availableDates = allDates.filter(d =>
-    clusterNames().some(c => getForDate(c, "dau", d) !== null) || getForDate(BLR_TOTAL_LABEL, "dau", d) !== null
+    clusterNames().some(c => getForRange(c, "dau", d, d) !== null) || getForRange(BLR_TOTAL_LABEL, "dau", d, d) !== null
   );
-  if (!ACTIVE_CLUSTERS_DATE || !availableDates.includes(ACTIVE_CLUSTERS_DATE)) {
-    ACTIVE_CLUSTERS_DATE = availableDates.length ? availableDates[availableDates.length - 1] : DATA.anchor_date;
-  }
-  const selDate = ACTIVE_CLUSTERS_DATE;
+  const defaultDate = availableDates.length ? availableDates[availableDates.length - 1] : DATA.anchor_date;
+  if (!ACTIVE_CLUSTERS_START || !availableDates.includes(ACTIVE_CLUSTERS_START)) ACTIVE_CLUSTERS_START = defaultDate;
+  if (!ACTIVE_CLUSTERS_END || !availableDates.includes(ACTIVE_CLUSTERS_END)) ACTIVE_CLUSTERS_END = defaultDate;
+  // Swap rather than reject if the user picks "From" after "To" -- a
+  // stray "invalid range" error is worse than just showing it flipped.
+  let startDate = ACTIVE_CLUSTERS_START, endDate = ACTIVE_CLUSTERS_END;
+  if (startDate > endDate) { [startDate, endDate] = [endDate, startDate]; }
 
-  const dateOptions = availableDates.slice().reverse().map(d =>
-    `<option value="${d}" ${d === selDate ? "selected" : ""}>${fmtDate(d)}</option>`).join("");
+  const minDate = availableDates.length ? availableDates[0] : "";
+  const maxDate = availableDates.length ? availableDates[availableDates.length - 1] : "";
+  const isRange = startDate !== endDate;
+  const rangeLabel = isRange ? `${fmtDate(startDate)} – ${fmtDate(endDate)}` : fmtDate(startDate);
 
-  // Re-sort by the SELECTED date's DAU (not always "latest"), so the
-  // ranking on screen actually matches whichever day is picked.
-  const namesForDate = clusterNames().slice().sort(
-    (a, b) => (getForDate(b, "dau", selDate) || 0) - (getForDate(a, "dau", selDate) || 0)
+  // Re-sort by the SELECTED range's average DAU (not always "latest"),
+  // so the ranking on screen actually matches whatever's being viewed.
+  const namesForRange = clusterNames().slice().sort(
+    (a, b) => (getForRange(b, "dau", startDate, endDate) || 0) - (getForRange(a, "dau", startDate, endDate) || 0)
   );
 
-  const dauRows  = namesForDate.map(c => ({ name: c, dau: getForDate(c, "dau", selDate) }));
-  const prodRows = namesForDate.map(c => ({ name: c, v: getForDate(c, "mechanic_productivity_90d", selDate) }));
-  const enqRows  = namesForDate.map(c => ({ name: c, v: getForDate(c, "enquiry_total", selDate) }));
-  const convRows = namesForDate.map(c => ({ name: c, v: getForDate(c, "enquiry_to_attachment_pct", selDate) }));
-  const cityProd = getForDate(BLR_TOTAL_LABEL, "mechanic_productivity_90d", selDate);
+  const dauRows  = namesForRange.map(c => ({ name: c, dau: getForRange(c, "dau", startDate, endDate) }));
+  const prodRows = namesForRange.map(c => ({ name: c, v: getForRange(c, "mechanic_productivity_90d", startDate, endDate) }));
+  const enqRows  = namesForRange.map(c => ({ name: c, v: getForRange(c, "enquiry_total", startDate, endDate) }));
+  const convRows = namesForRange.map(c => ({ name: c, v: getForRange(c, "enquiry_to_attachment_pct", startDate, endDate) }));
+  const cityProd = getForRange(BLR_TOTAL_LABEL, "mechanic_productivity_90d", startDate, endDate);
 
   return `
     <section id="clusters">
       <div class="eyebrow">By Cluster</div>
       <div class="title disp" style="font-size:28px;">Ranked by Cluster</div>
-      <p class="deck-desc">Where the fleet is actually being used, and how maintenance/enquiries break down, on ${fmtDate(selDate)}.</p>
+      <p class="deck-desc">Where the fleet is actually being used, and how maintenance/enquiries break down${isRange ? ", averaged per day" : ""} for ${rangeLabel}.</p>
       <div class="toolbar">
-        <select class="cluster-pick" onchange="setClustersDate(this.value)">${dateOptions}</select>
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+          <label style="font-size:12.5px;color:var(--text-dim);display:flex;align-items:center;gap:6px;">From
+            <input type="date" class="cluster-pick" value="${startDate}" min="${minDate}" max="${maxDate}" onchange="setClustersStart(this.value)">
+          </label>
+          <label style="font-size:12.5px;color:var(--text-dim);display:flex;align-items:center;gap:6px;">To
+            <input type="date" class="cluster-pick" value="${endDate}" min="${minDate}" max="${maxDate}" onchange="setClustersEnd(this.value)">
+          </label>
+        </div>
       </div>
       <div class="panel">
-        <h3>Daily Active Users</h3>
+        <h3>Daily Active Users${isRange ? " (avg/day)" : ""}</h3>
         ${barChart(dauRows, r => r.dau, { fmt: v => Math.round(v).toLocaleString("en-IN") })}
       </div>
       <div class="panel">
@@ -395,7 +420,7 @@ function sectionClusters() {
         ${barChart(prodRows, r => r.v, { fmt: v => v.toFixed(2) })}
       </div>
       <div class="panel">
-        <h3>Enquiries logged &amp; conversion to Attachment</h3>
+        <h3>Enquiries logged &amp; conversion to Attachment${isRange ? " (avg/day)" : ""}</h3>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
           <div>${barChart(enqRows, r => r.v, { fmt: v => Math.round(v) })}</div>
           <div>${barChart(convRows, r => r.v, { fmt: v => v.toFixed(0) + "%", max: 100 })}</div>
@@ -469,7 +494,8 @@ function render() {
 function setTab(i) { ACTIVE_TAB = i; render(); }
 function setCentreTab(i) { ACTIVE_CENTRE_TAB = i; render(); }
 function setCluster(c) { ACTIVE_CLUSTER = c; render(); }
-function setClustersDate(d) { ACTIVE_CLUSTERS_DATE = d; render(); }
+function setClustersStart(d) { ACTIVE_CLUSTERS_START = d; render(); }
+function setClustersEnd(d) { ACTIVE_CLUSTERS_END = d; render(); }
 
 document.getElementById("asOfLabel").textContent = fmtDate(DATA.anchor_date);
 render();
