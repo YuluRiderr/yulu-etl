@@ -73,6 +73,17 @@ UTIL_METRICS = [
     "non_live_on_road", "non_live_at_warehouse", "stuck_repairable", "non_live_whs_on_road",
     "actual_live_dau_pct", "util_pct",
 ]
+# Raw counts only (no percentages -- summing a percentage isn't
+# meaningful) -- used by _fill_missing_util_totals below.
+UTIL_RAW_COUNT_METRICS = [
+    "all_bikes_in_cluster", "dau_tagged", "live_in_cluster", "not_reserved",
+    "non_live_on_road", "non_live_at_warehouse", "stuck_repairable", "non_live_whs_on_road",
+]
+# Spellings Cluster_Utilization_Log's own city-wide rollup row has been
+# observed using (case-insensitive) -- kept in sync with app.js's own
+# UTIL_TOTAL_LABELS constant.
+UTIL_TOTAL_LABELS = {"grand total", "blr (total)"}
+
 # Every metric, including enquiry_total, is AVERAGED per day over a
 # period -- not summed. A summed window total isn't comparable against a
 # single day's value (e.g. a 21-day sum vs. "Latest Day" always reads as
@@ -117,6 +128,40 @@ def to_float(v):
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _fill_missing_util_totals(records: list[dict]) -> list[dict]:
+    """
+    Cluster_Utilization_Log's own "Grand Total" row has been observed
+    missing a raw-count column (confirmed live: dau_tagged blank) on a
+    date where every individual cluster that same date has a real value
+    -- the source sheet's own total formula apparently doesn't cover
+    every column. Mutates each date's total row in place, filling any
+    such blank with the sum of that date's cluster values, so the total
+    row is never missing a number the underlying clusters clearly have.
+    Percentages (actual_live_dau_pct/util_pct) are deliberately left
+    alone -- summing a percentage isn't meaningful.
+    """
+    by_date: dict[str, list[dict]] = {}
+    for r in records:
+        d = r.get("date")
+        if d:
+            by_date.setdefault(d, []).append(r)
+
+    for rows in by_date.values():
+        total_row = next(
+            (r for r in rows if str(r.get("cluster", "")).strip().lower() in UTIL_TOTAL_LABELS), None)
+        if total_row is None:
+            continue
+        cluster_rows = [r for r in rows if r is not total_row]
+        for metric in UTIL_RAW_COUNT_METRICS:
+            if to_float(total_row.get(metric)) is not None:
+                continue
+            vals = [v for v in (to_float(r.get(metric)) for r in cluster_rows) if v is not None]
+            if vals:
+                total_row[metric] = sum(vals)
+
+    return records
 
 
 def build_period_comparison(by_cluster_date: dict, anchor: date, metrics: list[str] = METRICS) -> dict:
@@ -230,6 +275,7 @@ def main():
     try:
         util_records = fetch_rows(UTIL_SHEET_TAB)
         print(f"Fetched {len(util_records)} row(s) from '{UTIL_SHEET_TAB}'.")
+        util_records = _fill_missing_util_totals(util_records)
     except Exception as e:
         print(f"WARNING: could not fetch '{UTIL_SHEET_TAB}' ({e}); utilization will be empty")
         util_records = []

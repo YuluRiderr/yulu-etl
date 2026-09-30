@@ -66,6 +66,8 @@ let ACTIVE_CLUSTER = BLR_TOTAL_LABEL;
 let ACTIVE_CLUSTERS_START = null;
 let ACTIVE_CLUSTERS_END = null;
 let ACTIVE_UTIL_CLUSTER = null; // resolved lazily in sectionUtilization()
+let ACTIVE_UTIL_METRIC = "util_pct"; // which single metric the utilization trend chart plots
+let ACTIVE_UTIL_SNAPSHOT_DATE = null; // resolved lazily -- which date the Full Snapshot table shows
 const CHART_INSTANCES = [];
 
 function fmtDate(d) {
@@ -133,6 +135,17 @@ function utilSeries(cluster, metric) {
   const c = UTIL.series ? UTIL.series[cluster] : null;
   if (!c || !c[metric]) return [];
   return c[metric];
+}
+
+// A single arbitrary captured date's value, for the Full Snapshot
+// table's own date picker -- reads the daily series by index rather
+// than the named-period object (which only has "latest"/"p0_7"/etc).
+function getUtilForDate(cluster, metric, date) {
+  const dates = UTIL.dates || [];
+  const idx = dates.indexOf(date);
+  if (idx === -1) return null;
+  const v = utilSeries(cluster, metric)[idx];
+  return (v === undefined) ? null : v;
 }
 
 // Averages a metric over [startDate, endDate] (inclusive) using the
@@ -319,16 +332,15 @@ function renderCharts() {
       const dt = new Date(d + "T00:00:00");
       return dt.toLocaleDateString("en-IN", { day: "2-digit", month: "short" });
     });
+    const activeMetricCol = UTIL_TABLE_COLS.find(c => c.key === ACTIVE_UTIL_METRIC) || UTIL_TABLE_COLS[UTIL_TABLE_COLS.length - 1];
+    const unit = activeMetricCol.pct ? "%" : "";
     const utilInst = new Chart(utilCtx, {
       type: "line",
       data: {
         labels: utilLabels,
         datasets: [
-          { label: "Utilization %", data: utilSeries(ACTIVE_UTIL_CLUSTER, "util_pct"),
+          { label: activeMetricCol.label, data: utilSeries(ACTIVE_UTIL_CLUSTER, ACTIVE_UTIL_METRIC),
             borderColor: cssVar("--accent"), backgroundColor: cssVar("--accent"),
-            borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: 0.25, spanGaps: true },
-          { label: "Actual Live/DAU %", data: utilSeries(ACTIVE_UTIL_CLUSTER, "actual_live_dau_pct"),
-            borderColor: cssVar("--accent2"), backgroundColor: cssVar("--accent2"),
             borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: 0.25, spanGaps: true },
         ],
       },
@@ -337,7 +349,7 @@ function renderCharts() {
         maintainAspectRatio: false,
         interaction: { mode: "index", intersect: false },
         plugins: { legend: { display: false }, tooltip: { callbacks: {
-          label: (item) => `${item.dataset.label}: ${item.formattedValue}%`,
+          label: (item) => `${item.dataset.label}: ${item.formattedValue}${unit}`,
         } } },
         scales: {
           x: { grid: { display: false }, ticks: { color: textColor, maxTicksLimit: 6, font: { size: 10 } } },
@@ -482,24 +494,34 @@ function sectionUtilization() {
     ACTIVE_UTIL_CLUSTER = totalName || names[0] || null;
   }
 
-  const options = pickerChoices.map(c =>
+  const clusterOptions = pickerChoices.map(c =>
     `<option value="${c}" ${c === ACTIVE_UTIL_CLUSTER ? "selected" : ""}>${c}</option>`).join("");
+  const metricOptions = UTIL_TABLE_COLS.map(col =>
+    `<option value="${col.key}" ${col.key === ACTIVE_UTIL_METRIC ? "selected" : ""}>${col.label}</option>`).join("");
+  const activeMetricCol = UTIL_TABLE_COLS.find(c => c.key === ACTIVE_UTIL_METRIC) || UTIL_TABLE_COLS[UTIL_TABLE_COLS.length - 1];
 
   const rankRows = names
     .map(c => ({ name: c, v: getUtil(c, "util_pct", "latest") }))
     .filter(r => r.v !== null);
 
-  const oldestDate = UTIL.dates && UTIL.dates.length ? UTIL.dates[0] : UTIL.anchor_date;
+  const utilDates = UTIL.dates || [];
+  const oldestDate = utilDates.length ? utilDates[0] : UTIL.anchor_date;
+  const latestUtilDate = utilDates.length ? utilDates[utilDates.length - 1] : UTIL.anchor_date;
 
   // Full snapshot table -- every column, every row (total first, if the
-  // sheet's own rollup label was recognised), exactly as the source
-  // sheet has it for the latest captured date. A cluster missing just
-  // one column still shows every other column it has; only that one
-  // cell reads "-".
+  // sheet's own rollup label was recognised), for WHICHEVER date is
+  // selected (own picker, independent of the trend chart's cluster
+  // picker above). A cluster missing just one column still shows every
+  // other column it has; only that one cell reads "-".
+  if (!ACTIVE_UTIL_SNAPSHOT_DATE || !utilDates.includes(ACTIVE_UTIL_SNAPSHOT_DATE)) {
+    ACTIVE_UTIL_SNAPSHOT_DATE = latestUtilDate;
+  }
+  const snapshotDate = ACTIVE_UTIL_SNAPSHOT_DATE;
+
   const tableRows = totalName ? [totalName, ...names] : names;
   const utilTableBody = tableRows.map(c => {
     const cells = UTIL_TABLE_COLS.map(col => {
-      const v = getUtil(c, col.key, "latest");
+      const v = getUtilForDate(c, col.key, snapshotDate);
       if (v === null || v === undefined) return `<td class="dash">–</td>`;
       return `<td class="num">${col.pct ? v.toFixed(1) + "%" : Math.round(v).toLocaleString("en-IN")}</td>`;
     }).join("");
@@ -512,11 +534,13 @@ function sectionUtilization() {
       <div class="title disp" style="font-size:28px;">Cluster Utilization Trend</div>
       <p class="deck-desc">Daily snapshot of a live, formula-driven Utilization% sheet${cityUtil !== null ? ` — city-wide ${cityUtil.toFixed(1)}%` : ""} as of ${fmtDate(UTIL.anchor_date)}. The source sheet itself has no history of its own, so this trend only goes back as far as the daily snapshot has been running (from ${fmtDate(oldestDate)}).</p>
       <div class="toolbar">
-        <select class="cluster-pick" onchange="setUtilCluster(this.value)">${options}</select>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+          <select class="cluster-pick" onchange="setUtilCluster(this.value)">${clusterOptions}</select>
+          <select class="cluster-pick" onchange="setUtilMetric(this.value)">${metricOptions}</select>
+        </div>
       </div>
       <div class="chart-card">
-        <h4>Utilization % &amp; Actual Live/DAU %</h4>
-        <div class="legend"><span><i style="background:var(--accent)"></i>Utilization %</span><span><i style="background:var(--accent2)"></i>Actual Live/DAU %</span></div>
+        <h4>${activeMetricCol.label} — ${ACTIVE_UTIL_CLUSTER}</h4>
         <div class="box" style="height:220px;"><canvas id="util-chart"></canvas></div>
       </div>
       <div class="panel">
@@ -524,7 +548,10 @@ function sectionUtilization() {
         ${barChart(rankRows, r => r.v, { fmt: v => v.toFixed(1) + "%", max: 100 })}
       </div>
       <div class="panel" style="overflow-x:auto;">
-        <h3>Full Snapshot — Every Column (${fmtDate(UTIL.anchor_date)})</h3>
+        <div class="toolbar" style="margin-bottom:10px;">
+          <h3 style="margin:0;">Full Snapshot — Every Column</h3>
+          <input type="date" class="cluster-pick" value="${snapshotDate}" min="${oldestDate}" max="${latestUtilDate}" onchange="setUtilSnapshotDate(this.value)">
+        </div>
         <table class="ptable">
           <thead><tr><th>Cluster</th>${UTIL_TABLE_COLS.map(col => `<th>${col.label}</th>`).join("")}</tr></thead>
           <tbody>${utilTableBody}</tbody>
@@ -681,6 +708,8 @@ function setCluster(c) { ACTIVE_CLUSTER = c; render(); }
 function setClustersStart(d) { ACTIVE_CLUSTERS_START = d; render(); }
 function setClustersEnd(d) { ACTIVE_CLUSTERS_END = d; render(); }
 function setUtilCluster(c) { ACTIVE_UTIL_CLUSTER = c; render(); }
+function setUtilMetric(m) { ACTIVE_UTIL_METRIC = m; render(); }
+function setUtilSnapshotDate(d) { ACTIVE_UTIL_SNAPSHOT_DATE = d; render(); }
 
 document.getElementById("asOfLabel").textContent = fmtDate(DATA.anchor_date);
 render();
