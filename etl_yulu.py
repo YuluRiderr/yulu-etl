@@ -1504,7 +1504,7 @@ def _compute_daily_ops_rows_for_date(demand_day: pd.DataFrame, token_day: pd.Dat
 # yesterday alone. Confirmed live: the underlying Metabase source data
 # for a given day keeps changing for more than 24 hours after the fact
 # (late-landing/corrected events), so the old behaviour -- touching only
-# "yesterday" at each of the 1 PM / 9 PM passes -- meant the day before
+# "yesterday" at each of the 9 AM / 12 PM passes -- meant the day before
 # yesterday got written once and then frozen forever, even while its
 # source kept drifting for another day or two. Re-touching a wider
 # trailing window every run means any date whose source has settled by
@@ -2119,17 +2119,20 @@ def main():
         "--daily-ops-metrics-only",
         action="store_true",
         help=(
-            "Run ONLY process_daily_ops_metrics() and exit — skips Sweep/"
-            "Octopus/Stuck/Parts_Summary/Warehouse/Cluster Utilization "
-            "entirely. Recomputes and overwrites a trailing "
-            "DAILY_OPS_REFRESH_WINDOW_DAYS-day window ending yesterday "
-            "(not just yesterday alone) every call, since the upstream "
-            "Metabase source data keeps changing for more than a single "
+            "Run process_daily_ops_metrics() AND process_cluster_utilization_snapshot() "
+            "then exit -- skips Sweep/Octopus/Stuck/Parts_Summary/Warehouse "
+            "entirely. Both are grouped here because their source data isn't "
+            "reliably settled at 1 AM (Metabase for the former, the live "
+            "'Utilization' sheet for the latter). Daily Ops Metrics recomputes "
+            "and overwrites a trailing DAILY_OPS_REFRESH_WINDOW_DAYS-day window "
+            "ending yesterday (not just yesterday alone) every call, since the "
+            "upstream Metabase source data keeps changing for more than a single "
             "day after the fact -- same principle as never caching the "
             "current/open month elsewhere in this file, just applied to a "
             "short rolling window instead of a whole month. Safe to re-run "
             "any number of times same-day: every date in the window is "
-            "independently deleted-then-appended."
+            "independently deleted-then-appended, and the utilization "
+            "snapshot for today is idempotent the same way."
         ),
     )
     args = parser.parse_args()
@@ -2154,6 +2157,32 @@ def main():
 
     if args.daily_ops_metrics_only:
         process_daily_ops_metrics(gc)
+
+        # Cluster Utilization Snapshot moved here from the 1 AM path --
+        # confirmed live: a 1 AM snapshot of the "Utilization" sheet (fed
+        # by the day's real ridership activity) captured near-zero counts
+        # and a flat 100% ratio across every cluster, because the day's
+        # activity hasn't really started yet that early. Same "not
+        # settled yet" problem Daily Ops Metrics had, moved here for the
+        # same reason -- run alongside it at 9 AM/12 PM IST instead. A
+        # bad 1 AM snapshot could never be corrected retroactively (the
+        # source sheet has no history of its own), so avoiding it here
+        # matters more than for Daily Ops Metrics, which can at least be
+        # backfilled from Metabase after the fact.
+        try:
+            process_cluster_utilization_snapshot(gc)
+        except Exception as e:
+            # {e!r} instead of {e} -- gspread's SpreadsheetNotFound/
+            # WorksheetNotFound are raised with NO message at all, so plain
+            # {e} silently prints an empty string and hides which exception
+            # actually fired. repr() always shows at least the exception's
+            # class name (e.g. "SpreadsheetNotFound()"), which is enough to
+            # tell "wrong ID/tab name" apart from "service account has no
+            # access to this spreadsheet" (Google's Sheets API returns 404,
+            # not 403, for a file the caller can't see, so a missing-access
+            # case and a genuinely wrong ID look identical here).
+            print(f"  WARNING: Cluster Utilization Snapshot step failed, skipping: {e!r}")
+
         print("\n✅ Daily Ops Metrics re-fetch complete.")
         return
 
@@ -2167,25 +2196,12 @@ def main():
     # -- confirmed the underlying Metabase source data for "yesterday"
     # isn't reliably settled yet that early, so writing a row here just
     # means writing one we already know is likely wrong. It's instead
-    # computed for the first time at 1 PM IST, then re-fetched again at
-    # 9 PM IST -- see daily_etl.yml's two --daily-ops-metrics-only cron
-    # entries. This 1 AM run only handles the live/current-state steps
-    # above (Sweep/Octopus/Stuck/Warehouse), which have no such
-    # settling-time problem.
-
-    try:
-        process_cluster_utilization_snapshot(gc)
-    except Exception as e:
-        # {e!r} instead of {e} -- gspread's SpreadsheetNotFound/
-        # WorksheetNotFound are raised with NO message at all, so plain
-        # {e} silently prints an empty string and hides which exception
-        # actually fired. repr() always shows at least the exception's
-        # class name (e.g. "SpreadsheetNotFound()"), which is enough to
-        # tell "wrong ID/tab name" apart from "service account has no
-        # access to this spreadsheet" (Google's Sheets API returns 404,
-        # not 403, for a file the caller can't see, so a missing-access
-        # case and a genuinely wrong ID look identical here).
-        print(f"  WARNING: Cluster Utilization Snapshot step failed, skipping: {e!r}")
+    # computed for the first time at 9 AM IST, then re-fetched again at
+    # 12 PM IST -- see daily_etl.yml's two --daily-ops-metrics-only cron
+    # entries. Cluster Utilization Snapshot moved there too, for the
+    # identical reason (see the comment on that call above). This 1 AM
+    # run only handles the live/current-state steps above (Sweep/Octopus/
+    # Stuck/Warehouse), which have no such settling-time problem.
 
     print("\n✅ ETL complete.")
 

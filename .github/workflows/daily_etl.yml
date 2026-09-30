@@ -5,15 +5,19 @@ on:
     # 1:00 AM IST = 19:30 UTC (previous day) -- normal full daily ETL.
     - cron: "30 19 * * *"
     # 9:00 AM IST = 03:30 UTC, and 12:00 PM IST = 06:30 UTC -- Daily Ops
-    # Metrics ONLY. Moved from the earlier 1 PM/9 PM slots per explicit
-    # request. The 1 AM run above still doesn't compute Daily Ops Metrics
-    # at all (etl_yulu.py's main() deliberately skips STEP F on the normal
-    # daily path). Each of these two passes recomputes and overwrites a
-    # trailing multi-day window (DAILY_OPS_REFRESH_WINDOW_DAYS in
-    # etl_yulu.py), not just yesterday alone -- the source data keeps
-    # drifting for more than a single day after the fact, so a date needs
-    # to be re-touched across more than one calendar day to actually catch
-    # up with it.
+    # Metrics AND Cluster Utilization Snapshot. Moved from the earlier
+    # 1 PM/9 PM slots per explicit request. The 1 AM run above no longer
+    # computes either of these (etl_yulu.py's main() deliberately skips
+    # both on the normal daily path) -- their underlying source data
+    # isn't reliably settled that early. Each of these two passes
+    # recomputes and overwrites a trailing multi-day window
+    # (DAILY_OPS_REFRESH_WINDOW_DAYS in etl_yulu.py) for Daily Ops
+    # Metrics, not just yesterday alone -- the source data keeps drifting
+    # for more than a single day after the fact, so a date needs to be
+    # re-touched across more than one calendar day to actually catch up
+    # with it. Cluster Utilization Snapshot only ever captures "today"
+    # (its source sheet has no history), so the 12 PM pass simply
+    # overwrites the 9 AM pass's snapshot with a more-settled one.
     - cron: "30 3 * * *"
     - cron: "30 6 * * *"
   workflow_dispatch: # allows manual trigger from GitHub UI
