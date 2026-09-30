@@ -4,21 +4,18 @@ on:
   schedule:
     # 1:00 AM IST = 19:30 UTC (previous day) -- normal full daily ETL.
     - cron: "30 19 * * *"
-    # 1:00 PM IST = 07:30 UTC, and 9:00 PM IST = 15:30 UTC -- Daily Ops
-    # Metrics ONLY. The 1 AM run above no longer computes Daily Ops
-    # Metrics at all (etl_yulu.py's main() deliberately skips STEP F on
-    # the normal daily path) -- confirmed the source data isn't reliably
-    # settled that early, so writing a row at 1 AM just means writing one
-    # already known to be wrong. Its FIRST computation is this 1 PM pass
-    # instead; the 9 PM pass re-fetches and overwrites the SAME rolling
-    # window a second time. Each of these two passes recomputes and
-    # overwrites a trailing multi-day window (DAILY_OPS_REFRESH_WINDOW_DAYS
-    # in etl_yulu.py), not just yesterday alone -- the source data keeps
+    # 9:00 AM IST = 03:30 UTC, and 12:00 PM IST = 06:30 UTC -- Daily Ops
+    # Metrics ONLY. Moved from the earlier 1 PM/9 PM slots per explicit
+    # request. The 1 AM run above still doesn't compute Daily Ops Metrics
+    # at all (etl_yulu.py's main() deliberately skips STEP F on the normal
+    # daily path). Each of these two passes recomputes and overwrites a
+    # trailing multi-day window (DAILY_OPS_REFRESH_WINDOW_DAYS in
+    # etl_yulu.py), not just yesterday alone -- the source data keeps
     # drifting for more than a single day after the fact, so a date needs
     # to be re-touched across more than one calendar day to actually catch
     # up with it.
-    - cron: "30 7 * * *"
-    - cron: "30 15 * * *"
+    - cron: "30 3 * * *"
+    - cron: "30 6 * * *"
   workflow_dispatch: # allows manual trigger from GitHub UI
     inputs:
       daily_ops_backfill_start:
@@ -76,7 +73,7 @@ jobs:
           BACKFILL_START: ${{ github.event.inputs.daily_ops_backfill_start }}
           BACKFILL_END: ${{ github.event.inputs.daily_ops_backfill_end }}
           BACKFILL_OVERWRITE: ${{ github.event.inputs.daily_ops_backfill_overwrite }}
-          IS_METRICS_ONLY_SCHEDULE: ${{ github.event_name == 'schedule' && (github.event.schedule == '30 7 * * *' || github.event.schedule == '30 15 * * *') }}
+          IS_METRICS_ONLY_SCHEDULE: ${{ github.event_name == 'schedule' && (github.event.schedule == '30 3 * * *' || github.event.schedule == '30 6 * * *') }}
         run: |
           if [ -n "$BACKFILL_START" ]; then
             ARGS=(--daily-ops-backfill-start "$BACKFILL_START")

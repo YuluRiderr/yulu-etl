@@ -26,6 +26,14 @@ by the same STEP F run) and aggregates it the same two ways, nested under
 a separate top-level "by_centre" key in data.js — fulfillment%/TAT only,
 grouped by individual Yulu Centre instead of cluster. Additive: the
 existing top-level "clusters"/"dates"/"series" keys are untouched.
+
+Also fetches 'Cluster_Utilization_Log' (written daily by etl_yulu.py's
+STEP G -- a snapshot of an otherwise-live, history-less "Utilization%"
+sheet), aggregated the same two ways under a top-level "utilization" key.
+Whatever row labels that sheet uses for its own city-wide rollup (e.g.
+"Grand Total"/"Out Of Cluster") pass through as-is as just another
+"cluster" name here -- no special-casing, since this file never talks to
+that source sheet directly to confirm the exact spelling.
 """
 
 import json
@@ -38,13 +46,14 @@ import gspread
 MASTER_SHEET_ID = "1fBjHKwlxRGwjsOSjzHOB6cUjvaKrhvtXdaPGeZjZuH0"
 SHEET_TAB = "Daily_Ops_Metrics"
 BYCENTRE_SHEET_TAB = "Daily_Ops_Metrics_ByCentre"
+UTIL_SHEET_TAB = "Cluster_Utilization_Log"
 BLR_TOTAL_LABEL = "BLR (Total)"
 
 METRICS = [
     "dau",
     "service_swap_fulfillment_pct_user", "service_swap_fulfillment_pct_token", "service_swap_tat_mins",
     "attachment_fulfillment_pct_user", "attachment_fulfillment_pct_token", "attachment_tat_mins",
-    "mechanic_productivity_90d",
+    "mechanic_productivity_90d", "mechanic_productivity_lt90d",
     "enquiry_total", "enquiry_to_attachment_pct",
 ]
 
@@ -55,6 +64,12 @@ CENTRE_METRICS = [
     "service_swap_fulfillment_pct_user", "service_swap_fulfillment_pct_token", "service_swap_tat_mins",
     "attachment_fulfillment_pct_user", "attachment_fulfillment_pct_token", "attachment_tat_mins",
 ]
+
+# Cluster_Utilization_Log columns (see etl_yulu.py's CLUSTER_UTIL_COLS) --
+# util_pct and actual_live_dau_pct are the two percentages that matter for
+# a trend view; all_bikes_in_cluster gives the dashboard something to
+# rank clusters by (util_pct alone doesn't say how big a cluster even is).
+UTIL_METRICS = ["util_pct", "actual_live_dau_pct", "all_bikes_in_cluster"]
 # Every metric, including enquiry_total, is AVERAGED per day over a
 # period -- not summed. A summed window total isn't comparable against a
 # single day's value (e.g. a 21-day sum vs. "Latest Day" always reads as
@@ -206,19 +221,34 @@ def main():
 
     result["by_centre"] = aggregate(centre_records, group_field="yulu_centre", metrics=CENTRE_METRICS)
 
+    # Cluster Utilization trend -- a separate, additive top-level key,
+    # same fetch-independently-so-one-failure-never-blocks-the-rest
+    # pattern as by_centre above.
+    try:
+        util_records = fetch_rows(UTIL_SHEET_TAB)
+        print(f"Fetched {len(util_records)} row(s) from '{UTIL_SHEET_TAB}'.")
+    except Exception as e:
+        print(f"WARNING: could not fetch '{UTIL_SHEET_TAB}' ({e}); utilization will be empty")
+        util_records = []
+
+    result["utilization"] = aggregate(util_records, group_field="cluster", metrics=UTIL_METRICS)
+
     with open("data.js", "w", encoding="utf-8") as f:
         f.write("window.OPS_DATA = ")
         json.dump(result, f, indent=2)
         f.write(";\n")
 
     by_centre = result["by_centre"]
+    utilization = result["utilization"]
     print(
         f"Wrote data.js — anchor_date={result.get('anchor_date')}, "
         f"days_captured={result.get('days_captured')}, "
         f"{len(result.get('clusters', {}))} cluster(s), "
         f"{len(result.get('dates', []))} series date(s); "
         f"by_centre: {len(by_centre.get('clusters', {}))} centre(s), "
-        f"{by_centre.get('days_captured', 0)} day(s) captured."
+        f"{by_centre.get('days_captured', 0)} day(s) captured; "
+        f"utilization: {len(utilization.get('clusters', {}))} cluster(s), "
+        f"{utilization.get('days_captured', 0)} day(s) captured."
     )
 
 

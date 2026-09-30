@@ -24,7 +24,8 @@ const METRIC_TABS = [
   { key: "service_swap_fulfillment_pct_token", label: "Swap Fulfillment (Token)", fmt: v => v.toFixed(1), unit: "%" },
   { key: "attachment_fulfillment_pct_user", label: "Attach Fulfillment (User)", fmt: v => v.toFixed(1), unit: "%" },
   { key: "attachment_fulfillment_pct_token", label: "Attach Fulfillment (Token)", fmt: v => v.toFixed(1), unit: "%" },
-  { key: "mechanic_productivity_90d", label: "Mech. Productivity", fmt: v => v.toFixed(2), unit: "" },
+  { key: "mechanic_productivity_90d", label: "Mech. Productivity (>90d)", fmt: v => v.toFixed(2), unit: "" },
+  { key: "mechanic_productivity_lt90d", label: "Mech. Productivity (≤90d)", fmt: v => v.toFixed(2), unit: "" },
   { key: "enquiry_total", label: "Enquiries (avg/day)", fmt: v => v.toFixed(1), unit: "" },
   { key: "enquiry_to_attachment_pct", label: "Enquiry Conversion", fmt: v => v.toFixed(1), unit: "%" },
 ];
@@ -43,6 +44,20 @@ const CENTRE_METRIC_TABS = [
   { key: "attachment_fulfillment_pct_token", label: "Attach Fulfillment (Token)", fmt: v => v.toFixed(1), unit: "%" },
 ];
 
+// Cluster Utilization trend -- a separate, additive object nested under
+// DATA.utilization by build_data.py (a daily snapshot of an otherwise
+// live, history-less "Utilization%" sheet -- see etl_yulu.py's STEP G).
+// Same anchor_date/days_captured/clusters/dates/series shape as DATA
+// itself, just keyed by whatever "cluster" label that source sheet uses
+// (including its own city-wide rollup row, whatever it's actually called).
+const UTIL = DATA.utilization || { anchor_date: null, days_captured: 0, clusters: {}, dates: [], series: {} };
+// Known spellings for that sheet's own city-wide rollup row -- pulled out
+// as a separate "city figure" rather than shown in the per-cluster ranked
+// list, same treatment BLR_TOTAL_LABEL gets elsewhere. If the real sheet
+// uses some other spelling, this just falls through gracefully: that row
+// shows up as an ordinary cluster in the list instead of being pulled out.
+const UTIL_TOTAL_LABELS = ["Grand Total", "BLR (Total)"];
+
 let ACTIVE_TAB = 0;
 let ACTIVE_CENTRE_TAB = 0;
 let ACTIVE_CLUSTER = BLR_TOTAL_LABEL;
@@ -50,6 +65,7 @@ let ACTIVE_CLUSTER = BLR_TOTAL_LABEL;
 // (default: the single most recent captured date, i.e. a 1-day "range").
 let ACTIVE_CLUSTERS_START = null;
 let ACTIVE_CLUSTERS_END = null;
+let ACTIVE_UTIL_CLUSTER = null; // resolved lazily in sectionUtilization()
 const CHART_INSTANCES = [];
 
 function fmtDate(d) {
@@ -89,6 +105,32 @@ function getCentre(centre, metric, period) {
 
 function series(cluster, metric) {
   const c = DATA.series ? DATA.series[cluster] : null;
+  if (!c || !c[metric]) return [];
+  return c[metric];
+}
+
+function isUtilTotalLabel(name) {
+  return UTIL_TOTAL_LABELS.some(l => l.toLowerCase() === String(name).toLowerCase());
+}
+
+function utilTotalName() {
+  return Object.keys(UTIL.clusters).find(isUtilTotalLabel) || null;
+}
+
+function utilClusterNames() {
+  return Object.keys(UTIL.clusters).filter(c => !isUtilTotalLabel(c)).sort(
+    (a, b) => (getUtil(b, "all_bikes_in_cluster", "latest") || 0) - (getUtil(a, "all_bikes_in_cluster", "latest") || 0)
+  );
+}
+
+function getUtil(cluster, metric, period) {
+  const c = UTIL.clusters[cluster];
+  if (!c || !c[metric]) return null;
+  return c[metric][period];
+}
+
+function utilSeries(cluster, metric) {
+  const c = UTIL.series ? UTIL.series[cluster] : null;
   if (!c || !c[metric]) return [];
   return c[metric];
 }
@@ -158,6 +200,7 @@ function sectionOverview() {
   const attachUser = get(BLR_TOTAL_LABEL, "attachment_fulfillment_pct_user", "latest");
   const attachToken = get(BLR_TOTAL_LABEL, "attachment_fulfillment_pct_token", "latest");
   const prod = get(BLR_TOTAL_LABEL, "mechanic_productivity_90d", "latest");
+  const prodNew = get(BLR_TOTAL_LABEL, "mechanic_productivity_lt90d", "latest");
   const enq = get(BLR_TOTAL_LABEL, "enquiry_total", "latest");
   const conv = get(BLR_TOTAL_LABEL, "enquiry_to_attachment_pct", "latest");
 
@@ -170,7 +213,7 @@ function sectionOverview() {
         ${kpiTile("DAU", dau !== null ? Math.round(dau).toLocaleString("en-IN") : "—", "", "riders / day")}
         ${kpiTileDual("Swap Fulfillment", "user", swapUser, "token", swapToken, "%")}
         ${kpiTileDual("Attach Fulfillment", "user", attachUser, "token", attachToken, "%")}
-        ${kpiTile("Mech. Productivity", prod !== null ? prod.toFixed(2) : "—", "", "bikes / mechanic (&gt;90d)")}
+        ${kpiTileDual("Mech. Productivity", "&gt;90d", prod, "≤90d", prodNew, "")}
         ${kpiTile("Enquiries", enq !== null ? Math.round(enq) : "—", "", conv !== null ? `${conv.toFixed(1)}% → attached` : "")}
       </div>
     </section>`;
@@ -186,7 +229,10 @@ const TREND_CHARTS = [
       { key: "attachment_fulfillment_pct_user", label: "User", color: "--accent" },
       { key: "attachment_fulfillment_pct_token", label: "Token", color: "--accent2" },
     ], unit: "%" },
-  { title: "Mechanic Productivity", metrics: [{ key: "mechanic_productivity_90d", label: "bikes / mechanic", color: "--accent" }] },
+  { title: "Mechanic Productivity", metrics: [
+      { key: "mechanic_productivity_90d", label: ">90d", color: "--accent" },
+      { key: "mechanic_productivity_lt90d", label: "≤90d", color: "--accent2" },
+    ] },
   { title: "Enquiries", metrics: [{ key: "enquiry_total", label: "Enquiries", color: "--accent" }] },
   { title: "Enquiry → Attachment", metrics: [{ key: "enquiry_to_attachment_pct", label: "Conversion", color: "--accent2" }], unit: "%" },
 ];
@@ -262,6 +308,45 @@ function renderCharts() {
     });
     CHART_INSTANCES.push(inst);
   });
+
+  // Utilization trend -- separate data source (UTIL, not DATA), so drawn
+  // here rather than folded into the TREND_CHARTS loop above, but still
+  // inside the same reset/redraw cycle (CHART_INSTANCES already cleared
+  // at the top of this function).
+  const utilCtx = document.getElementById("util-chart");
+  if (utilCtx && UTIL.dates && UTIL.dates.length) {
+    const utilLabels = UTIL.dates.map(d => {
+      const dt = new Date(d + "T00:00:00");
+      return dt.toLocaleDateString("en-IN", { day: "2-digit", month: "short" });
+    });
+    const utilInst = new Chart(utilCtx, {
+      type: "line",
+      data: {
+        labels: utilLabels,
+        datasets: [
+          { label: "Utilization %", data: utilSeries(ACTIVE_UTIL_CLUSTER, "util_pct"),
+            borderColor: cssVar("--accent"), backgroundColor: cssVar("--accent"),
+            borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: 0.25, spanGaps: true },
+          { label: "Actual Live/DAU %", data: utilSeries(ACTIVE_UTIL_CLUSTER, "actual_live_dau_pct"),
+            borderColor: cssVar("--accent2"), backgroundColor: cssVar("--accent2"),
+            borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: 0.25, spanGaps: true },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: "index", intersect: false },
+        plugins: { legend: { display: false }, tooltip: { callbacks: {
+          label: (item) => `${item.dataset.label}: ${item.formattedValue}%`,
+        } } },
+        scales: {
+          x: { grid: { display: false }, ticks: { color: textColor, maxTicksLimit: 6, font: { size: 10 } } },
+          y: { grid: { color: gridColor }, ticks: { color: textColor, font: { size: 10 } } },
+        },
+      },
+    });
+    CHART_INSTANCES.push(utilInst);
+  }
 }
 
 function sectionCompare() {
@@ -363,6 +448,54 @@ function sectionByCentre() {
     </section>`;
 }
 
+function sectionUtilization() {
+  if (!UTIL.anchor_date) {
+    return `
+      <section id="utilization">
+        <div class="eyebrow">Utilization</div>
+        <div class="title disp" style="font-size:28px;">Cluster Utilization Trend</div>
+        <div class="panel"><div class="empty-note">No utilization snapshot captured yet — this fills in once Cluster_Utilization_Log's first run lands.</div></div>
+      </section>`;
+  }
+
+  const totalName = utilTotalName();
+  const cityUtil = totalName ? getUtil(totalName, "util_pct", "latest") : null;
+  const names = utilClusterNames();
+  const pickerChoices = totalName ? [totalName, ...names] : names;
+
+  if (!ACTIVE_UTIL_CLUSTER || !pickerChoices.includes(ACTIVE_UTIL_CLUSTER)) {
+    ACTIVE_UTIL_CLUSTER = totalName || names[0] || null;
+  }
+
+  const options = pickerChoices.map(c =>
+    `<option value="${c}" ${c === ACTIVE_UTIL_CLUSTER ? "selected" : ""}>${c}</option>`).join("");
+
+  const rankRows = names
+    .map(c => ({ name: c, v: getUtil(c, "util_pct", "latest") }))
+    .filter(r => r.v !== null);
+
+  const oldestDate = UTIL.dates && UTIL.dates.length ? UTIL.dates[0] : UTIL.anchor_date;
+
+  return `
+    <section id="utilization">
+      <div class="eyebrow">Utilization</div>
+      <div class="title disp" style="font-size:28px;">Cluster Utilization Trend</div>
+      <p class="deck-desc">Daily snapshot of a live, formula-driven Utilization% sheet${cityUtil !== null ? ` — city-wide ${cityUtil.toFixed(1)}%` : ""} as of ${fmtDate(UTIL.anchor_date)}. The source sheet itself has no history of its own, so this trend only goes back as far as the daily snapshot has been running (from ${fmtDate(oldestDate)}).</p>
+      <div class="toolbar">
+        <select class="cluster-pick" onchange="setUtilCluster(this.value)">${options}</select>
+      </div>
+      <div class="chart-card">
+        <h4>Utilization % &amp; Actual Live/DAU %</h4>
+        <div class="legend"><span><i style="background:var(--accent)"></i>Utilization %</span><span><i style="background:var(--accent2)"></i>Actual Live/DAU %</span></div>
+        <div class="box" style="height:220px;"><canvas id="util-chart"></canvas></div>
+      </div>
+      <div class="panel">
+        <h3>Utilization % — Ranked by Cluster (${fmtDate(UTIL.anchor_date)})</h3>
+        ${barChart(rankRows, r => r.v, { fmt: v => v.toFixed(1) + "%", max: 100 })}
+      </div>
+    </section>`;
+}
+
 function sectionClusters() {
   const allDates = DATA.dates || [];
   // Only offer dates where at least one cluster actually has a DAU value
@@ -390,11 +523,20 @@ function sectionClusters() {
     (a, b) => (getForRange(b, "dau", startDate, endDate) || 0) - (getForRange(a, "dau", startDate, endDate) || 0)
   );
 
-  const dauRows  = namesForRange.map(c => ({ name: c, dau: getForRange(c, "dau", startDate, endDate) }));
-  const prodRows = namesForRange.map(c => ({ name: c, v: getForRange(c, "mechanic_productivity_90d", startDate, endDate) }));
-  const enqRows  = namesForRange.map(c => ({ name: c, v: getForRange(c, "enquiry_total", startDate, endDate) }));
-  const convRows = namesForRange.map(c => ({ name: c, v: getForRange(c, "enquiry_to_attachment_pct", startDate, endDate) }));
-  const cityProd = getForRange(BLR_TOTAL_LABEL, "mechanic_productivity_90d", startDate, endDate);
+  // Rows with a null value for THIS metric are dropped from THIS chart
+  // only -- a cluster with no enquiry data for the range shouldn't show
+  // a blank "-" bar, but it may still have perfectly good DAU data and
+  // belong in that chart. Filtering happens per chart, not by excluding
+  // the cluster everywhere.
+  const notNull = rows => rows.filter(r => r.dau !== undefined ? r.dau !== null : r.v !== null);
+
+  const dauRows     = notNull(namesForRange.map(c => ({ name: c, dau: getForRange(c, "dau", startDate, endDate) })));
+  const prodRows    = notNull(namesForRange.map(c => ({ name: c, v: getForRange(c, "mechanic_productivity_90d", startDate, endDate) })));
+  const prodNewRows = notNull(namesForRange.map(c => ({ name: c, v: getForRange(c, "mechanic_productivity_lt90d", startDate, endDate) })));
+  const enqRows     = notNull(namesForRange.map(c => ({ name: c, v: getForRange(c, "enquiry_total", startDate, endDate) })));
+  const convRows    = notNull(namesForRange.map(c => ({ name: c, v: getForRange(c, "enquiry_to_attachment_pct", startDate, endDate) })));
+  const cityProd    = getForRange(BLR_TOTAL_LABEL, "mechanic_productivity_90d", startDate, endDate);
+  const cityProdNew = getForRange(BLR_TOTAL_LABEL, "mechanic_productivity_lt90d", startDate, endDate);
 
   return `
     <section id="clusters">
@@ -416,8 +558,12 @@ function sectionClusters() {
         ${barChart(dauRows, r => r.dau, { fmt: v => Math.round(v).toLocaleString("en-IN") })}
       </div>
       <div class="panel">
-        <h3>Mechanic Productivity — city avg. ${cityProd !== null ? cityProd.toFixed(2) : "—"}</h3>
+        <h3>Mechanic Productivity (&gt;90d) — city avg. ${cityProd !== null ? cityProd.toFixed(2) : "—"}</h3>
         ${barChart(prodRows, r => r.v, { fmt: v => v.toFixed(2) })}
+      </div>
+      <div class="panel">
+        <h3>Mechanic Productivity (≤90d) — city avg. ${cityProdNew !== null ? cityProdNew.toFixed(2) : "—"}</h3>
+        ${barChart(prodNewRows, r => r.v, { fmt: v => v.toFixed(2) })}
       </div>
       <div class="panel">
         <h3>Enquiries logged &amp; conversion to Attachment${isRange ? " (avg/day)" : ""}</h3>
@@ -486,6 +632,7 @@ function render() {
     sectionCompare(),
     sectionClusters(),
     sectionByCentre(),
+    sectionUtilization(),
     sectionAttention(),
   ].join("");
   renderCharts();
@@ -496,6 +643,7 @@ function setCentreTab(i) { ACTIVE_CENTRE_TAB = i; render(); }
 function setCluster(c) { ACTIVE_CLUSTER = c; render(); }
 function setClustersStart(d) { ACTIVE_CLUSTERS_START = d; render(); }
 function setClustersEnd(d) { ACTIVE_CLUSTERS_END = d; render(); }
+function setUtilCluster(c) { ACTIVE_UTIL_CLUSTER = c; render(); }
 
 document.getElementById("asOfLabel").textContent = fmtDate(DATA.anchor_date);
 render();

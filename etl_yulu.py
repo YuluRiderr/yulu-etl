@@ -148,7 +148,7 @@ DAILY_OPS_COLS_ORDER = [
     "cluster", "date", "dau",
     "service_swap_fulfillment_pct_user", "service_swap_fulfillment_pct_token", "service_swap_tat_mins",
     "attachment_fulfillment_pct_user", "attachment_fulfillment_pct_token", "attachment_tat_mins",
-    "mechanic_productivity_90d",
+    "mechanic_productivity_90d", "mechanic_productivity_lt90d",
     "enquiry_total", "enquiry_to_attachment_pct",
 ]
 
@@ -1273,6 +1273,61 @@ def _prep_demand_df(demand_df: pd.DataFrame) -> pd.DataFrame:
     return demand_df.rename(columns={"cluster_name": "cluster"})
 
 
+def _mechanic_productivity(mech_day: pd.DataFrame, days_old_mask, col_name: str,
+                            warn_label: str, report_date: str) -> pd.DataFrame:
+    """
+    Shared implementation for mechanic productivity, parameterised by a
+    days_old eligibility predicate -- used for BOTH
+    mechanic_productivity_90d (tenured mechanics, DOJ > 90 days) and
+    mechanic_productivity_lt90d (newer mechanics, DOJ <= 90 days), so the
+    two only differ in which population they're computed over. Denominator
+    = ONLY maintenance-profile people: primary_role == "Maintenance" (the
+    mechanic's actual HR role, not the task's own "role" column, which is
+    always "Maintenance" for every row in this report regardless of who
+    performed it), same eligibility rule as compute_mechanics_audit() in
+    the reference sync script. mechanic_count is the unique count of
+    exactly this population; never task/row counts.
+    """
+    eligible = mech_day[
+        (mech_day["primary_role"] == "Maintenance")
+        & mech_day["days_old"].notna()
+        & days_old_mask(mech_day["days_old"])
+    ].copy()
+
+    if eligible.empty:
+        print(f"  WARNING: no eligible mechanics ({warn_label}) found for "
+              f"{report_date} — {col_name} will be 0 for every cluster.")
+        return pd.DataFrame(columns=["cluster", col_name])
+
+    eligible["qc_norm"] = eligible["QC pass/fail"].fillna("").astype(str).str.strip().str.lower()
+    eligible["live_repair_flag"] = pd.to_numeric(
+        eligible["live_repair_flag"], errors="coerce").fillna(0).astype(int)
+
+    # Duplicate under BLR_TOTAL_LABEL so the city-total productivity is
+    # (all BLR regular bikes + all BLR live bikes/3) / all eligible BLR
+    # mechanics — not an average of the per-cluster ratios. Done AFTER
+    # qc_norm/live_repair_flag are derived, so both copies carry them.
+    eligible = pd.concat(
+        [eligible, eligible.assign(start_cluster=BLR_TOTAL_LABEL)], ignore_index=True)
+
+    not_failed   = eligible["qc_norm"] != "fail"
+    regular_mask = not_failed & (eligible["live_repair_flag"] == 0)
+    live_mask    = not_failed & (eligible["live_repair_flag"] == 1)
+
+    mechanic_counts = eligible.groupby("start_cluster")["user_id"].nunique().rename("mechanic_count")
+    regular_counts  = eligible[regular_mask].groupby("start_cluster")["bike_name"].nunique().rename("regular_bikes")
+    live_counts     = eligible[live_mask].groupby("start_cluster")["bike_name"].nunique().rename("live_bikes")
+
+    productivity = pd.concat([mechanic_counts, regular_counts, live_counts], axis=1).fillna(0)
+    productivity[col_name] = productivity.apply(
+        lambda r: round(
+            (r["regular_bikes"] + r["live_bikes"] / LIVE_REPAIR_NORMALIZATION) / r["mechanic_count"], 3
+        ) if r["mechanic_count"] else None,
+        axis=1,
+    )
+    return productivity.reset_index().rename(columns={"start_cluster": "cluster"})[["cluster", col_name]]
+
+
 def _compute_daily_ops_rows_for_date(demand_day: pd.DataFrame, token_day: pd.DataFrame,
                                       mech_day: pd.DataFrame, agg_day: pd.DataFrame,
                                       report_date: str) -> pd.DataFrame:
@@ -1291,13 +1346,17 @@ def _compute_daily_ops_rows_for_date(demand_day: pd.DataFrame, token_day: pd.Dat
       - attachment fulfillment% (token) + TAT              (Token Flow, 11765)
       - attachment fulfillment% (user)                     (aggregate-for-percentage, 13490)
       - mechanic productivity, mechanics >90 days old       (Mechanic Flow, 8966)
+      - mechanic productivity, mechanics <=90 days old       (Mechanic Flow, 8966)
       - enquiry_total + enquiry->attachment%                (Token Flow, 11765)
 
-    Mechanic productivity (confirmed logic): for mechanics with
-    primary_role == "Maintenance" and date_of_joining more than
-    MECH_PRODUCTIVITY_MIN_DAYS_OLD days before the report date, in a given
-    cluster: (unique bikes with live_repair_flag==0 and QC pass/fail !=
-    "fail" [blank counts as not-fail]) + (unique bikes with
+    Mechanic productivity (confirmed logic, see _mechanic_productivity):
+    for mechanics with primary_role == "Maintenance" and date_of_joining
+    more/less than MECH_PRODUCTIVITY_MIN_DAYS_OLD days before the report
+    date (mechanic_productivity_90d = more than; mechanic_productivity_lt90d
+    = 90 days or less -- the same math over the complementary population,
+    to see new hires separately), in a given cluster: (unique bikes with
+    live_repair_flag==0 and QC pass/fail != "fail" [blank counts as
+    not-fail]) + (unique bikes with
     live_repair_flag==1 / LIVE_REPAIR_NORMALIZATION), divided by the
     unique count of those mechanics. No task_type filter (repair +
     non-repair tasks both count, per explicit confirmation).
@@ -1367,58 +1426,21 @@ def _compute_daily_ops_rows_for_date(demand_day: pd.DataFrame, token_day: pd.Dat
         .reset_index().rename(columns={"index": "cluster"})
     )
 
-    # Denominator = ONLY maintenance-profile people: primary_role ==
-    # "Maintenance" (the mechanic's actual HR role, not the task's own
-    # "role" column, which is always "Maintenance" for every row in this
-    # report regardless of who performed it) AND DOJ > 90 days — same
-    # eligibility rule as compute_mechanics_audit() in the reference sync
-    # script. mechanic_count below is the unique count of exactly this
-    # population; it is never task/row counts.
-    eligible = mech_day[
-        (mech_day["primary_role"] == "Maintenance")
-        & mech_day["days_old"].notna()
-        & (mech_day["days_old"] > MECH_PRODUCTIVITY_MIN_DAYS_OLD)
-    ].copy()
-
-    if eligible.empty:
-        print(f"  WARNING: no eligible mechanics (Maintenance, DOJ > "
-              f"{MECH_PRODUCTIVITY_MIN_DAYS_OLD}d) found for {report_date} — "
-              f"mechanic_productivity_90d will be 0 for every cluster.")
-        productivity = pd.DataFrame(columns=["cluster", "mechanic_productivity_90d"])
-    else:
-        eligible["qc_norm"] = eligible["QC pass/fail"].fillna("").astype(str).str.strip().str.lower()
-        eligible["live_repair_flag"] = pd.to_numeric(
-            eligible["live_repair_flag"], errors="coerce").fillna(0).astype(int)
-
-        # Duplicate under BLR_TOTAL_LABEL so the city-total productivity is
-        # (all BLR regular bikes + all BLR live bikes/3) / all eligible BLR
-        # mechanics — not an average of the per-cluster ratios. Done AFTER
-        # qc_norm/live_repair_flag are derived, so both copies carry them.
-        eligible = pd.concat(
-            [eligible, eligible.assign(start_cluster=BLR_TOTAL_LABEL)], ignore_index=True)
-
-        not_failed   = eligible["qc_norm"] != "fail"
-        regular_mask = not_failed & (eligible["live_repair_flag"] == 0)
-        live_mask    = not_failed & (eligible["live_repair_flag"] == 1)
-
-        mechanic_counts = eligible.groupby("start_cluster")["user_id"].nunique().rename("mechanic_count")
-        regular_counts  = eligible[regular_mask].groupby("start_cluster")["bike_name"].nunique().rename("regular_bikes")
-        live_counts     = eligible[live_mask].groupby("start_cluster")["bike_name"].nunique().rename("live_bikes")
-
-        productivity = pd.concat([mechanic_counts, regular_counts, live_counts], axis=1).fillna(0)
-        productivity["mechanic_productivity_90d"] = productivity.apply(
-            lambda r: round(
-                (r["regular_bikes"] + r["live_bikes"] / LIVE_REPAIR_NORMALIZATION) / r["mechanic_count"], 3
-            ) if r["mechanic_count"] else None,
-            axis=1,
-        )
-        productivity = productivity.reset_index().rename(
-            columns={"start_cluster": "cluster"})[["cluster", "mechanic_productivity_90d"]]
+    productivity = _mechanic_productivity(
+        mech_day, lambda d: d > MECH_PRODUCTIVITY_MIN_DAYS_OLD, "mechanic_productivity_90d",
+        f"Maintenance, DOJ > {MECH_PRODUCTIVITY_MIN_DAYS_OLD}d", report_date)
+    # Same math, mirror population: newer mechanics (DOJ <= 90 days) --
+    # per explicit request, to see how new hires perform separately from
+    # the tenured mechanic_productivity_90d population above.
+    productivity_new = _mechanic_productivity(
+        mech_day, lambda d: d <= MECH_PRODUCTIVITY_MIN_DAYS_OLD, "mechanic_productivity_lt90d",
+        f"Maintenance, DOJ <= {MECH_PRODUCTIVITY_MIN_DAYS_OLD}d", report_date)
 
     # ---- Merge everything onto the Demand Metrics cluster list ----
     result = base.merge(swap_metrics, on="cluster", how="left")
     result = result.merge(attach_metrics, on="cluster", how="left")
     result = result.merge(productivity, on="cluster", how="left")
+    result = result.merge(productivity_new, on="cluster", how="left")
     result = result.merge(enquiry_summary, on="cluster", how="left")
 
     # User-level fulfillment% (service_swap + attachment) is sourced from
@@ -1436,9 +1458,10 @@ def _compute_daily_ops_rows_for_date(demand_day: pd.DataFrame, token_day: pd.Dat
     result = result.drop(columns=["service_swap_fulfillment_pct_user", "attachment_fulfillment_pct_user"])
     result = result.merge(agg_user_pct, on="cluster", how="left")
 
-    # No eligible mechanics (Maintenance, DOJ > 90d) for a cluster that day
-    # reads as 0 productivity, not blank — confirmed explicitly.
+    # No eligible mechanics for a cluster that day reads as 0 productivity,
+    # not blank — confirmed explicitly. Applies to both populations.
     result["mechanic_productivity_90d"] = result["mechanic_productivity_90d"].fillna(0)
+    result["mechanic_productivity_lt90d"] = result["mechanic_productivity_lt90d"].fillna(0)
 
     result.insert(1, "date", report_date)
     return result[DAILY_OPS_COLS_ORDER]
