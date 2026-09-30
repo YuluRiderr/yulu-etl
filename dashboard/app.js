@@ -65,9 +65,6 @@ let ACTIVE_CLUSTER = BLR_TOTAL_LABEL;
 // (default: the single most recent captured date, i.e. a 1-day "range").
 let ACTIVE_CLUSTERS_START = null;
 let ACTIVE_CLUSTERS_END = null;
-let ACTIVE_UTIL_CLUSTER = null; // resolved lazily in sectionUtilization()
-let ACTIVE_UTIL_METRIC = "util_pct"; // which single metric the utilization trend chart plots
-let ACTIVE_UTIL_SNAPSHOT_DATE = null; // resolved lazily -- which date the Full Snapshot table shows
 const CHART_INSTANCES = [];
 
 function fmtDate(d) {
@@ -321,44 +318,6 @@ function renderCharts() {
     });
     CHART_INSTANCES.push(inst);
   });
-
-  // Utilization trend -- separate data source (UTIL, not DATA), so drawn
-  // here rather than folded into the TREND_CHARTS loop above, but still
-  // inside the same reset/redraw cycle (CHART_INSTANCES already cleared
-  // at the top of this function).
-  const utilCtx = document.getElementById("util-chart");
-  if (utilCtx && UTIL.dates && UTIL.dates.length) {
-    const utilLabels = UTIL.dates.map(d => {
-      const dt = new Date(d + "T00:00:00");
-      return dt.toLocaleDateString("en-IN", { day: "2-digit", month: "short" });
-    });
-    const activeMetricCol = UTIL_TABLE_COLS.find(c => c.key === ACTIVE_UTIL_METRIC) || UTIL_TABLE_COLS[UTIL_TABLE_COLS.length - 1];
-    const unit = activeMetricCol.pct ? "%" : "";
-    const utilInst = new Chart(utilCtx, {
-      type: "line",
-      data: {
-        labels: utilLabels,
-        datasets: [
-          { label: activeMetricCol.label, data: utilSeries(ACTIVE_UTIL_CLUSTER, ACTIVE_UTIL_METRIC),
-            borderColor: cssVar("--accent"), backgroundColor: cssVar("--accent"),
-            borderWidth: 2, pointRadius: 0, pointHoverRadius: 3, tension: 0.25, spanGaps: true },
-        ],
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        interaction: { mode: "index", intersect: false },
-        plugins: { legend: { display: false }, tooltip: { callbacks: {
-          label: (item) => `${item.dataset.label}: ${item.formattedValue}${unit}`,
-        } } },
-        scales: {
-          x: { grid: { display: false }, ticks: { color: textColor, maxTicksLimit: 6, font: { size: 10 } } },
-          y: { grid: { color: gridColor }, ticks: { color: textColor, font: { size: 10 } } },
-        },
-      },
-    });
-    CHART_INSTANCES.push(utilInst);
-  }
 }
 
 function sectionCompare() {
@@ -475,48 +434,48 @@ const UTIL_TABLE_COLS = [
   { key: "util_pct", label: "Util %", pct: true },
 ];
 
+// Cluster_Utilization_Log has been observed carrying dates whose rows
+// are all zeroed out (confirmed live: a 1 AM snapshot taken before the
+// day's real ridership activity started -- fixed going forward by
+// moving the snapshot to 9 AM/12 PM, but already-captured bad dates like
+// this can never be corrected retroactively, since the source sheet has
+// no history of its own). "All bikes in cluster" is used as the health
+// check rather than a percentage, since a percentage can coincidentally
+// still look plausible (e.g. a spurious 100%) even when the underlying
+// counts are all zero -- a real fleet is never actually 0 bikes.
+function latestValidUtilDate() {
+  const dates = UTIL.dates || [];
+  const totalName = utilTotalName();
+  const checkAgainst = totalName ? [totalName] : utilClusterNames();
+  for (let i = dates.length - 1; i >= 0; i--) {
+    const d = dates[i];
+    const healthy = checkAgainst.some(c => {
+      const v = getUtilForDate(c, "all_bikes_in_cluster", d);
+      return v !== null && v > 0;
+    });
+    if (healthy) return d;
+  }
+  return UTIL.anchor_date;
+}
+
 function sectionUtilization() {
   if (!UTIL.anchor_date) {
     return `
       <section id="utilization">
         <div class="eyebrow">Utilization</div>
-        <div class="title disp" style="font-size:28px;">Cluster Utilization Trend</div>
+        <div class="title disp" style="font-size:28px;">Cluster Utilization</div>
         <div class="panel"><div class="empty-note">No utilization snapshot captured yet — this fills in once Cluster_Utilization_Log's first run lands.</div></div>
       </section>`;
   }
 
+  const snapshotDate = latestValidUtilDate();
   const totalName = utilTotalName();
-  const cityUtil = totalName ? getUtil(totalName, "util_pct", "latest") : null;
+  const cityUtil = totalName ? getUtilForDate(totalName, "util_pct", snapshotDate) : null;
   const names = utilClusterNames();
-  const pickerChoices = totalName ? [totalName, ...names] : names;
-
-  if (!ACTIVE_UTIL_CLUSTER || !pickerChoices.includes(ACTIVE_UTIL_CLUSTER)) {
-    ACTIVE_UTIL_CLUSTER = totalName || names[0] || null;
-  }
-
-  const clusterOptions = pickerChoices.map(c =>
-    `<option value="${c}" ${c === ACTIVE_UTIL_CLUSTER ? "selected" : ""}>${c}</option>`).join("");
-  const metricOptions = UTIL_TABLE_COLS.map(col =>
-    `<option value="${col.key}" ${col.key === ACTIVE_UTIL_METRIC ? "selected" : ""}>${col.label}</option>`).join("");
-  const activeMetricCol = UTIL_TABLE_COLS.find(c => c.key === ACTIVE_UTIL_METRIC) || UTIL_TABLE_COLS[UTIL_TABLE_COLS.length - 1];
 
   const rankRows = names
-    .map(c => ({ name: c, v: getUtil(c, "util_pct", "latest") }))
+    .map(c => ({ name: c, v: getUtilForDate(c, "util_pct", snapshotDate) }))
     .filter(r => r.v !== null);
-
-  const utilDates = UTIL.dates || [];
-  const oldestDate = utilDates.length ? utilDates[0] : UTIL.anchor_date;
-  const latestUtilDate = utilDates.length ? utilDates[utilDates.length - 1] : UTIL.anchor_date;
-
-  // Full snapshot table -- every column, every row (total first, if the
-  // sheet's own rollup label was recognised), for WHICHEVER date is
-  // selected (own picker, independent of the trend chart's cluster
-  // picker above). A cluster missing just one column still shows every
-  // other column it has; only that one cell reads "-".
-  if (!ACTIVE_UTIL_SNAPSHOT_DATE || !utilDates.includes(ACTIVE_UTIL_SNAPSHOT_DATE)) {
-    ACTIVE_UTIL_SNAPSHOT_DATE = latestUtilDate;
-  }
-  const snapshotDate = ACTIVE_UTIL_SNAPSHOT_DATE;
 
   const tableRows = totalName ? [totalName, ...names] : names;
   const utilTableBody = tableRows.map(c => {
@@ -531,27 +490,14 @@ function sectionUtilization() {
   return `
     <section id="utilization">
       <div class="eyebrow">Utilization</div>
-      <div class="title disp" style="font-size:28px;">Cluster Utilization Trend</div>
-      <p class="deck-desc">Daily snapshot of a live, formula-driven Utilization% sheet${cityUtil !== null ? ` — city-wide ${cityUtil.toFixed(1)}%` : ""} as of ${fmtDate(UTIL.anchor_date)}. The source sheet itself has no history of its own, so this trend only goes back as far as the daily snapshot has been running (from ${fmtDate(oldestDate)}).</p>
-      <div class="toolbar">
-        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-          <select class="cluster-pick" onchange="setUtilCluster(this.value)">${clusterOptions}</select>
-          <select class="cluster-pick" onchange="setUtilMetric(this.value)">${metricOptions}</select>
-        </div>
-      </div>
-      <div class="chart-card">
-        <h4>${activeMetricCol.label} — ${ACTIVE_UTIL_CLUSTER}</h4>
-        <div class="box" style="height:220px;"><canvas id="util-chart"></canvas></div>
-      </div>
+      <div class="title disp" style="font-size:28px;">Cluster Utilization</div>
+      <p class="deck-desc">Latest available snapshot of a live, formula-driven Utilization% sheet${cityUtil !== null ? ` — city-wide ${cityUtil.toFixed(1)}%` : ""}, as of ${fmtDate(snapshotDate)}.</p>
       <div class="panel">
-        <h3>Utilization % — Ranked by Cluster (${fmtDate(UTIL.anchor_date)})</h3>
+        <h3>Utilization % — Ranked by Cluster (${fmtDate(snapshotDate)})</h3>
         ${barChart(rankRows, r => r.v, { fmt: v => v.toFixed(1) + "%", max: 100 })}
       </div>
       <div class="panel" style="overflow-x:auto;">
-        <div class="toolbar" style="margin-bottom:10px;">
-          <h3 style="margin:0;">Full Snapshot — Every Column</h3>
-          <input type="date" class="cluster-pick" value="${snapshotDate}" min="${oldestDate}" max="${latestUtilDate}" onchange="setUtilSnapshotDate(this.value)">
-        </div>
+        <h3>Full Snapshot — Every Column (${fmtDate(snapshotDate)})</h3>
         <table class="ptable">
           <thead><tr><th>Cluster</th>${UTIL_TABLE_COLS.map(col => `<th>${col.label}</th>`).join("")}</tr></thead>
           <tbody>${utilTableBody}</tbody>
@@ -707,9 +653,6 @@ function setCentreTab(i) { ACTIVE_CENTRE_TAB = i; render(); }
 function setCluster(c) { ACTIVE_CLUSTER = c; render(); }
 function setClustersStart(d) { ACTIVE_CLUSTERS_START = d; render(); }
 function setClustersEnd(d) { ACTIVE_CLUSTERS_END = d; render(); }
-function setUtilCluster(c) { ACTIVE_UTIL_CLUSTER = c; render(); }
-function setUtilMetric(m) { ACTIVE_UTIL_METRIC = m; render(); }
-function setUtilSnapshotDate(d) { ACTIVE_UTIL_SNAPSHOT_DATE = d; render(); }
 
 document.getElementById("asOfLabel").textContent = fmtDate(DATA.anchor_date);
 render();
