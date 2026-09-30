@@ -95,8 +95,8 @@ PERIODS = [
     ("latest", 0, 0),
     ("p0_7", 1, 7),
     ("p7_14", 8, 14),
-    ("p14_21", 15, 21),
-    ("p21_28", 22, 28),
+    ("p14_28", 15, 28),
+    ("p28_56", 29, 56),
 ]
 
 # How many trailing calendar days of daily-level detail to ship for trend

@@ -12,9 +12,9 @@ const AUTO_REFRESH_MS = 15 * 60 * 1000;
 // Day) column ends up comparing the freshest data against its own most
 // recent predecessor — i.e. "latest compared to previous", not the other
 // way around.
-const PERIOD_KEYS = ["p21_28", "p14_21", "p7_14", "p0_7", "latest"];
+const PERIOD_KEYS = ["p28_56", "p14_28", "p7_14", "p0_7", "latest"];
 const PERIOD_LABELS = {
-  p21_28: "21–28 Days Ago", p14_21: "14–21 Days Ago", p7_14: "7–14 Days Ago",
+  p28_56: "28–56 Days Ago", p14_28: "14–28 Days Ago", p7_14: "7–14 Days Ago",
   p0_7: "0–7 Days Ago", latest: "Latest Day",
 };
 

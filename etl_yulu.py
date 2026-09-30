@@ -602,6 +602,23 @@ def delete_rows_for_date_and_append(gc: gspread.Client, sheet_id: str, tab: str,
         header_row = header if header is not None else list(df.columns)
         ws = ss.add_worksheet(title=tab, rows=1000, cols=max(len(header_row) + 2, 10))
         ws.append_row(header_row, value_input_option="RAW")
+    else:
+        # FIX: an EXISTING tab's row 1 was never touched when a new column
+        # got added to `header` in code (e.g. mechanic_productivity_lt90d
+        # inserted mid-list) -- append_rows() below writes positionally, so
+        # every row appended after such a change would silently shift every
+        # column after the insertion point by one, with nothing in the
+        # sheet UI making that obvious (confirmed as a real risk here, not
+        # hypothetical: mechanic_productivity_lt90d was added between
+        # mechanic_productivity_90d and enquiry_total). If the header
+        # differs from what the code now expects, resync row 1 ONCE before
+        # ever appending a positionally-different row.
+        if header is not None:
+            current_header = ws.row_values(1)
+            if current_header != header:
+                ws.update("A1", [header], value_input_option="RAW")
+                print(f"  '{tab}' → header row was stale ({current_header}), "
+                      f"resynced to {header}.")
 
     col_idx = letter_to_index(date_col_letter)
     date_vals = ws.col_values(col_idx)
@@ -1886,6 +1903,18 @@ def _write_backfill_range_to_tab(ss, tab: str, cols_order: list[str], results: d
     try:
         ws = ss.worksheet(tab)
         raw_date_vals = [v for v in ws.col_values(2)[1:] if v]  # column B = date
+        # FIX: see the identical comment in delete_rows_for_date_and_append
+        # -- an EXISTING tab's row 1 is never touched when cols_order gains
+        # a new column mid-list (e.g. mechanic_productivity_lt90d), and
+        # append_rows() below writes positionally, so every row written
+        # after such a change silently shifts columns after the insertion
+        # point. Resync row 1 before ever appending a positionally-
+        # different row.
+        current_header = ws.row_values(1)
+        if current_header != cols_order:
+            ws.update("A1", [cols_order], value_input_option="RAW")
+            print(f"  '{tab}' → header row was stale ({current_header}), "
+                  f"resynced to {cols_order}.")
     except gspread.exceptions.WorksheetNotFound:
         print(f"  '{tab}' does not exist yet — creating it...")
         ws = ss.add_worksheet(title=tab, rows=1000, cols=max(len(cols_order) + 2, 10))
