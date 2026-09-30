@@ -448,6 +448,21 @@ function sectionByCentre() {
     </section>`;
 }
 
+// Every Cluster_Utilization_Log column, in sheet order, for the full
+// snapshot table -- not just the two percentages charted above.
+const UTIL_TABLE_COLS = [
+  { key: "all_bikes_in_cluster", label: "All Bikes" },
+  { key: "dau_tagged", label: "DAU Tagged" },
+  { key: "live_in_cluster", label: "Live in Cluster" },
+  { key: "not_reserved", label: "Not Reserved" },
+  { key: "non_live_on_road", label: "Non-Live On Road" },
+  { key: "non_live_at_warehouse", label: "Non-Live At WHS" },
+  { key: "stuck_repairable", label: "Stuck (Repairable)" },
+  { key: "non_live_whs_on_road", label: "Non-Live WHS On Road" },
+  { key: "actual_live_dau_pct", label: "Actual Live/DAU %", pct: true },
+  { key: "util_pct", label: "Util %", pct: true },
+];
+
 function sectionUtilization() {
   if (!UTIL.anchor_date) {
     return `
@@ -476,6 +491,21 @@ function sectionUtilization() {
 
   const oldestDate = UTIL.dates && UTIL.dates.length ? UTIL.dates[0] : UTIL.anchor_date;
 
+  // Full snapshot table -- every column, every row (total first, if the
+  // sheet's own rollup label was recognised), exactly as the source
+  // sheet has it for the latest captured date. A cluster missing just
+  // one column still shows every other column it has; only that one
+  // cell reads "-".
+  const tableRows = totalName ? [totalName, ...names] : names;
+  const utilTableBody = tableRows.map(c => {
+    const cells = UTIL_TABLE_COLS.map(col => {
+      const v = getUtil(c, col.key, "latest");
+      if (v === null || v === undefined) return `<td class="dash">–</td>`;
+      return `<td class="num">${col.pct ? v.toFixed(1) + "%" : Math.round(v).toLocaleString("en-IN")}</td>`;
+    }).join("");
+    return `<tr class="${c === totalName ? "total" : ""}"><td>${c}</td>${cells}</tr>`;
+  }).join("");
+
   return `
     <section id="utilization">
       <div class="eyebrow">Utilization</div>
@@ -492,6 +522,13 @@ function sectionUtilization() {
       <div class="panel">
         <h3>Utilization % — Ranked by Cluster (${fmtDate(UTIL.anchor_date)})</h3>
         ${barChart(rankRows, r => r.v, { fmt: v => v.toFixed(1) + "%", max: 100 })}
+      </div>
+      <div class="panel" style="overflow-x:auto;">
+        <h3>Full Snapshot — Every Column (${fmtDate(UTIL.anchor_date)})</h3>
+        <table class="ptable">
+          <thead><tr><th>Cluster</th>${UTIL_TABLE_COLS.map(col => `<th>${col.label}</th>`).join("")}</tr></thead>
+          <tbody>${utilTableBody}</tbody>
+        </table>
       </div>
     </section>`;
 }

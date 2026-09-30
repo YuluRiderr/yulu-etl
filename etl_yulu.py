@@ -336,8 +336,11 @@ def retry_on_api_error(max_retries=5, initial_delay=2, backoff_factor=2):
     Retry decorator for transient errors with exponential backoff — same
     idea proven out in a production Metabase sync script. Retries dropped
     connections, timeouts, and 429/500/502/503 from both `requests`
-    (Metabase) and gspread (Google Sheets); anything else propagates
-    immediately.
+    (Metabase) and gspread (Google Sheets); also retries the specific
+    known-transient MetabaseQueryError subclass (Athena "exhausted
+    resources" -- see _is_transient_metabase_query_error), since that one
+    means "not enough concurrent compute right now", not "this query is
+    broken". Everything else propagates immediately.
     """
     def decorator(func):
         @wraps(func)
@@ -375,6 +378,16 @@ def retry_on_api_error(max_retries=5, initial_delay=2, backoff_factor=2):
                         delay *= backoff_factor
                         continue
                     raise
+                except MetabaseQueryError as e:
+                    last_exception = e
+                    if _is_transient_metabase_query_error(str(e)) and attempt < max_retries - 1:
+                        print(f"  WARNING: transient Metabase/Athena resource error in "
+                              f"{func.__name__}, retrying in {delay}s "
+                              f"(attempt {attempt + 1}/{max_retries})")
+                        sleep(delay)
+                        delay *= backoff_factor
+                        continue
+                    raise
             raise last_exception
         return wrapper
     return decorator
@@ -385,10 +398,29 @@ class MetabaseQueryError(RuntimeError):
     Raised when Metabase's /api/card/:id/query/csv endpoint returns HTTP
     200 claiming CSV, but the body is actually a query-execution error
     (e.g. a missing/renamed warehouse table) disguised as data — confirmed
-    to happen in production. Deliberately not retried: retrying a broken
-    query doesn't fix it, so this should abort STEP F for this run rather
-    than silently writing 0s/blanks as if the underlying data were empty.
+    to happen in production. NOT retried by default: retrying a
+    permanently broken query (bad SQL, a renamed table) doesn't fix it,
+    so this should abort STEP F for this run rather than silently writing
+    0s/blanks as if the underlying data were empty. The one exception is
+    a known-TRANSIENT subclass -- see _is_transient_metabase_query_error
+    -- which retry_on_api_error() does retry.
     """
+
+
+def _is_transient_metabase_query_error(text: str) -> bool:
+    """
+    AWS Athena's "Query exhausted resources at this scale factor" error
+    (confirmed live, card 11765) means the workgroup didn't have enough
+    concurrent compute for this query RIGHT NOW -- not that the query
+    itself is broken. It's much more likely to happen when several of
+    our own cards query Athena at the same instant (this file fetches up
+    to 4 concurrently), and typically succeeds on a retry once that
+    concurrent load eases. This is the ONLY MetabaseQueryError variant
+    retried; anything else (a missing/renamed table, bad SQL) fails the
+    exact same way every time, so retrying it would just waste time
+    before failing anyway.
+    """
+    return "exhausted resources" in text.lower()
 
 
 def _looks_like_metabase_error_payload(text: str) -> bool:

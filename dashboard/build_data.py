@@ -65,11 +65,14 @@ CENTRE_METRICS = [
     "attachment_fulfillment_pct_user", "attachment_fulfillment_pct_token", "attachment_tat_mins",
 ]
 
-# Cluster_Utilization_Log columns (see etl_yulu.py's CLUSTER_UTIL_COLS) --
-# util_pct and actual_live_dau_pct are the two percentages that matter for
-# a trend view; all_bikes_in_cluster gives the dashboard something to
-# rank clusters by (util_pct alone doesn't say how big a cluster even is).
-UTIL_METRICS = ["util_pct", "actual_live_dau_pct", "all_bikes_in_cluster"]
+# Every column Cluster_Utilization_Log has (see etl_yulu.py's
+# CLUSTER_UTIL_COLS), minus "cluster" itself (that's the group_field, not
+# a metric) -- captures the whole table, not just the two percentages.
+UTIL_METRICS = [
+    "all_bikes_in_cluster", "dau_tagged", "live_in_cluster", "not_reserved",
+    "non_live_on_road", "non_live_at_warehouse", "stuck_repairable", "non_live_whs_on_road",
+    "actual_live_dau_pct", "util_pct",
+]
 # Every metric, including enquiry_total, is AVERAGED per day over a
 # period -- not summed. A summed window total isn't comparable against a
 # single day's value (e.g. a 21-day sum vs. "Latest Day" always reads as
