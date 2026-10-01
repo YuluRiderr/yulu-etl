@@ -35,6 +35,11 @@ on:
         required: false
         type: boolean
         default: false
+      daily_ops_metrics_only:
+        description: "Run ONLY Daily Ops Metrics + Cluster Utilization Snapshot right now (same as the 9 AM/12 PM schedule), ignored if a backfill start date is also set above -- use this to force today's refresh on demand instead of waiting on (or in case GitHub delayed/skipped) the scheduled 9 AM/12 PM run"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   run-etl:
@@ -77,7 +82,15 @@ jobs:
           BACKFILL_START: ${{ github.event.inputs.daily_ops_backfill_start }}
           BACKFILL_END: ${{ github.event.inputs.daily_ops_backfill_end }}
           BACKFILL_OVERWRITE: ${{ github.event.inputs.daily_ops_backfill_overwrite }}
-          IS_METRICS_ONLY_SCHEDULE: ${{ github.event_name == 'schedule' && (github.event.schedule == '30 3 * * *' || github.event.schedule == '30 6 * * *') }}
+          # True for either an actual scheduled 9 AM/12 PM firing, OR a
+          # manual run with the daily_ops_metrics_only checkbox ticked --
+          # the latter exists because GitHub's cron schedule is best-effort
+          # and can be delayed by hours or skipped outright (confirmed
+          # live, repeatedly), so a manual trigger with blank inputs
+          # otherwise falls through to the normal 1 AM-style full-ETL path
+          # (which deliberately never computes Daily Ops Metrics at all)
+          # instead of actually running what was needed.
+          IS_METRICS_ONLY_SCHEDULE: ${{ (github.event_name == 'schedule' && (github.event.schedule == '30 3 * * *' || github.event.schedule == '30 6 * * *')) || github.event.inputs.daily_ops_metrics_only == 'true' }}
         run: |
           if [ -n "$BACKFILL_START" ]; then
             ARGS=(--daily-ops-backfill-start "$BACKFILL_START")
