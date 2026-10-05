@@ -1,6 +1,13 @@
 name: Yulu Daily ETL
 
 on:
+  # On-demand refresh without needing GitHub UI/API access: committing a
+  # change to .github/refresh-now.txt runs the same Daily Ops Metrics +
+  # Cluster Utilization pass as the scheduled 9 AM/12 PM slots.
+  push:
+    branches: [main]
+    paths:
+      - ".github/refresh-now.txt"
   schedule:
     # 1:00 AM IST = 19:30 UTC (previous day) -- normal full daily ETL.
     - cron: "30 19 * * *"
@@ -20,6 +27,18 @@ on:
     # overwrites the 9 AM pass's snapshot with a more-settled one.
     - cron: "30 3 * * *"
     - cron: "30 6 * * *"
+    # GitHub starts `schedule` runs HOURS late for this repo (measured over
+    # several days: the 9 AM and 12 PM slots above actually start ~2:50-3:30
+    # PM and ~5:20-6:30 PM IST). These two slots are therefore scheduled
+    # EARLY, and the run holds itself until the real target time if it
+    # happens to start before it (hold_until_ist.sh), so the data lands at
+    # 9 AM / 12 PM IST whether GitHub is on time or several hours late. The
+    # two slots above stay as later fallback refreshes -- every pass is
+    # idempotent (it overwrites the same rolling window).
+    #   03:53 IST (22:23 UTC prev day) -> holds until 09:00 IST
+    #   06:37 IST (01:07 UTC)          -> holds until 12:00 IST
+    - cron: "23 22 * * *"
+    - cron: "7 1 * * *"
   workflow_dispatch: # allows manual trigger from GitHub UI
     inputs:
       daily_ops_backfill_start:
@@ -44,7 +63,8 @@ on:
 jobs:
   run-etl:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    # A run that starts early sleeps up to ~5h10m before doing its ~4 min of work.
+    timeout-minutes: 345
 
     steps:
       - name: Checkout repo
@@ -90,7 +110,8 @@ jobs:
           # otherwise falls through to the normal 1 AM-style full-ETL path
           # (which deliberately never computes Daily Ops Metrics at all)
           # instead of actually running what was needed.
-          IS_METRICS_ONLY_SCHEDULE: ${{ (github.event_name == 'schedule' && (github.event.schedule == '30 3 * * *' || github.event.schedule == '30 6 * * *')) || github.event.inputs.daily_ops_metrics_only == 'true' }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+          IS_METRICS_ONLY_SCHEDULE: ${{ (github.event_name == 'schedule' && (github.event.schedule == '30 3 * * *' || github.event.schedule == '30 6 * * *' || github.event.schedule == '23 22 * * *' || github.event.schedule == '7 1 * * *')) || github.event_name == 'push' || github.event.inputs.daily_ops_metrics_only == 'true' }}
         run: |
           if [ -n "$BACKFILL_START" ]; then
             ARGS=(--daily-ops-backfill-start "$BACKFILL_START")
@@ -102,6 +123,10 @@ jobs:
             fi
             python etl_yulu.py "${ARGS[@]}"
           elif [ "$IS_METRICS_ONLY_SCHEDULE" = "true" ]; then
+            case "$EVENT_SCHEDULE" in
+              "23 22 * * *") bash .github/scripts/hold_until_ist.sh 03:50 09:00 ;;
+              "7 1 * * *")   bash .github/scripts/hold_until_ist.sh 06:30 12:00 ;;
+            esac
             python etl_yulu.py --daily-ops-metrics-only
           else
             python etl_yulu.py

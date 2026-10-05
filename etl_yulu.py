@@ -99,7 +99,7 @@ import io
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from time import sleep
 
@@ -439,8 +439,15 @@ def _looks_like_metabase_error_payload(text: str) -> bool:
     )
 
 
+# Business days are IST, but GitHub's runners are UTC -- a bare datetime.now()
+# is a calendar day behind IST between 00:00 and 05:30 IST, so a run that
+# happens to land in that window (scheduled runs do start at odd hours)
+# would compute "yesterday" a day too early.
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
 def get_yesterday() -> str:
-    return (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    return (datetime.now(IST) - timedelta(days=1)).strftime("%Y-%m-%d")
 
 
 @retry_on_api_error(max_retries=5, initial_delay=2, backoff_factor=2)
@@ -2094,7 +2101,7 @@ def process_cluster_utilization_snapshot(gc: gspread.Client):
     src_ws = gc.open_by_key(CLUSTER_UTIL_SPREADSHEET_ID).worksheet(CLUSTER_UTIL_SOURCE_TAB)
     raw_rows = src_ws.get("B3:L200", value_render_option="UNFORMATTED_VALUE")
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(IST).strftime("%Y-%m-%d")
     result = _parse_cluster_util_rows(raw_rows, today)
 
     if result.empty:
