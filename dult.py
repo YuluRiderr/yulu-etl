@@ -61,7 +61,7 @@ DEFINITIONS = [
     "Active users = distinct riders. BLR (Total) is distinct across all of BLR, so it is not the sum of the clusters.",
     "Avg km / ride minutes per user = total km / minutes divided by active users. Monthly = total divided by the sum of daily active users.",
     "Avg trip duration = total ride minutes / trips (start to end, pauses included).",
-    "Deployed bikes = sum of pm_bor. Not operational = sum of pm_fault_bikes_in_cluster. Operational = deployed minus not operational. BLR (Total) = sum of the eight named clusters.",
+    "Deployed bikes = sum of pm_bor. A day with pm_bor of 0 is treated as missing and filled with the average of the last and next day that had bikes (same for not operational). Not operational = sum of pm_fault_bikes_in_cluster. Operational = deployed minus not operational. BLR (Total) = sum of the eight named clusters.",
     "Peak hours = trips by start hour, averaged per day over the window (days with no trips count as zero).",
 ]
 
@@ -365,6 +365,33 @@ def canonicalise_clusters(daily, hourly, bikes):
     return fixed
 
 
+def _neighbour_mean(known):
+    """Fill gaps with the mean of the previous and next known value (one side only at the ends)."""
+    prev, nxt = known.ffill(), known.bfill()
+    return ((prev + nxt) / 2).fillna(prev).fillna(nxt)
+
+
+def fill_zero_bor(bikes, dates):
+    """pm_bor of 0 (or no row) is a data gap, not an empty cluster: replace it with the average of the last
+    and the next day that had bikes. Not-operational is filled the same way on those days so operational
+    stays consistent. A cluster that never has bikes is left alone."""
+    all_dates = sorted(set(dates) | set(bikes["date"]))
+    parts = []
+    for cluster, g in bikes.groupby("cluster"):
+        g = g.drop_duplicates("date").set_index("date").reindex(all_dates)
+        known = g["deployed"] > 0
+        if not known.any():
+            parts.append(g.reindex(dates).assign(cluster=cluster).reset_index(names="date"))
+            continue
+        dep = _neighbour_mean(g["deployed"].where(known))
+        nop = _neighbour_mean(g["not_operational"].where(known))
+        g["deployed"] = g["deployed"].where(known, dep)
+        g["not_operational"] = g["not_operational"].where(known, nop)
+        parts.append(g.reindex(dates).assign(cluster=cluster).reset_index(names="date"))
+    out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=BIKE_COLS)
+    return out[BIKE_COLS]
+
+
 def _div(num, den):
     return num / den.where(den > 0)
 
@@ -381,7 +408,7 @@ def build_tables(daily_j, hourly_j, bikes, win_start, yesterday):
             [["trips_started", "trips_ended", "total_km", "total_minutes", "active_users"]].sum()
             .reindex(index).fillna(0))
 
-    bk = bikes[bikes["date"].isin(dates)]
+    bk = fill_zero_bor(bikes, dates)
     bk_total = bk[bk["cluster"] != OUTSIDE].groupby("date", as_index=False)[["deployed", "not_operational"]].sum()
     bk_total["cluster"] = BLR_TOTAL
     bk = pd.concat([bk[BIKE_COLS], bk_total[BIKE_COLS]], ignore_index=True)
