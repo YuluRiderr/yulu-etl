@@ -30,8 +30,10 @@ BIKE_CATEGORY = "Miracle"
 BLR_TOTAL = "BLR (Total)"
 OUTSIDE = "Outside cluster"
 # Only these clusters get their own rows and count towards BLR (Total); every other cluster is folded into OUTSIDE.
-KEEP_CLUSTERS = ["CBD", "Electronic City", "Hebbal", "Indiranagar", "ORR", "Whitefield"]
-CACHE_TAG = "v2"  # bump when KEEP_CLUSTERS or the folding rules change: old cache files are then ignored
+KEEP_CLUSTERS = ["CBD", "Electronic City", "Hebbal", "Indiranagar", "Jayanagar", "Koramangala", "ORR", "Whitefield"]
+# Known clusters that are folded into OUTSIDE. Any cluster name in neither list is dropped entirely.
+FOLD_CLUSTERS = ["BLR_DSU", "Cluster 1", "Cluster 2", "Cluster 3", "Yelahanka", "Outside cluster"]
+CACHE_TAG = "v3"  # bump when KEEP_CLUSTERS or the folding rules change: old cache files are then ignored
 
 START_CLUSTER_COL = "Start Operation Cluster Parent Geozone Name"
 END_CLUSTER_COL = "End Operation Cluster Parent Geozone Name"
@@ -53,13 +55,13 @@ PEAK_SUMMARY_OUT = ["cluster", "day_type", "peak_hour", "second_hour", "third_ho
 PEAK_OUT = ["cluster", "day_type", "hour", "avg_trips_per_day", "share_of_day_pct"]
 
 DEFINITIONS = [
-    f"Clusters: {', '.join(KEEP_CLUSTERS)} are reported individually and make up BLR (Total). Every other cluster, and trips with no cluster, are folded into Outside cluster, which is not part of BLR (Total).",
+    f"Clusters: {', '.join(KEEP_CLUSTERS)} are reported individually and make up BLR (Total). {', '.join(FOLD_CLUSTERS[:-1])} and trips with no cluster are folded into Outside cluster, which is not part of BLR (Total). Any other cluster name is dropped.",
     "Trip = shared journey of a Miracle bike in BLR, any ride status. Long-term-rental rows are excluded (0 km, not trips).",
     "A trip counts on the day it starts and in the cluster it starts in. Trips ended = same trips grouped by the cluster they end in.",
     "Active users = distinct riders. BLR (Total) is distinct across all of BLR, so it is not the sum of the clusters.",
     "Avg km / ride minutes per user = total km / minutes divided by active users. Monthly = total divided by the sum of daily active users.",
     "Avg trip duration = total ride minutes / trips (start to end, pauses included).",
-    "Deployed bikes = sum of pm_bor. Not operational = sum of pm_fault_bikes_in_cluster. Operational = deployed minus not operational. BLR (Total) = sum of the six kept clusters.",
+    "Deployed bikes = sum of pm_bor. Not operational = sum of pm_fault_bikes_in_cluster. Operational = deployed minus not operational. BLR (Total) = sum of the eight named clusters.",
     "Peak hours = trips by start hour, averaged per day over the window (days with no trips count as zero).",
 ]
 
@@ -171,10 +173,14 @@ def fetch_csv(card_id, values, timeout=900):
 
 
 def _fold_cluster(series):
-    keep = {" ".join(c.lower().split()): c for c in KEEP_CLUSTERS}
-    key = series.fillna("").astype(str).str.lower().str.split().str.join(" ")
-    key = key.str.removesuffix(" cluster")
-    return key.map(keep).fillna(OUTSIDE)
+    """Map raw names to a kept name or OUTSIDE; names on neither list become None (dropped by the caller)."""
+    norm = lambda c: " ".join(c.lower().split()).removesuffix(" cluster")
+    keep = {norm(c): c for c in KEEP_CLUSTERS}
+    fold = {norm(c) for c in FOLD_CLUSTERS} | {""}
+    key = series.fillna("").astype(str).map(norm)
+    out = key.map(keep)
+    out = out.where(out.notna(), key.map(lambda k: OUTSIDE if k in fold else None))
+    return out
 
 
 def aggregate_journeys(text):
@@ -206,6 +212,12 @@ def aggregate_journeys(text):
     df["minutes"] = pd.to_numeric(df["Total Journey Time"], errors="coerce").fillna(0.0) / 60.0
     df["hour"] = pd.to_numeric(df["Start Time"].fillna("").str[:2], errors="coerce")
     df["start_cluster"] = _fold_cluster(df[START_CLUSTER_COL])
+    unknown = df[START_CLUSTER_COL].fillna("")[df["start_cluster"].isna()]
+    if len(unknown):
+        print(f"  journeys: dropped {len(unknown)} trips from unlisted clusters {sorted(set(unknown))[:10]}")
+    df = df[df["start_cluster"].notna()].copy()
+    if df.empty:
+        return empty
     has_end = df["End Time"].fillna("").str.strip() != "" if "End Time" in df.columns else pd.Series(True, index=df.index)
     end_col = df[END_CLUSTER_COL] if END_CLUSTER_COL in df.columns else pd.Series("", index=df.index)
     df["end_cluster"] = _fold_cluster(end_col)
@@ -251,6 +263,7 @@ def parse_bikes(text):
     df = df[df["cluster_name"].fillna("").str.strip() != ""].copy()
     df["date"] = df["date"].str[:10]
     df["cluster"] = _fold_cluster(df["cluster_name"])
+    df = df[df["cluster"].notna()]
     df["deployed"] = pd.to_numeric(df["pm_bor"], errors="coerce").fillna(0)
     df["not_operational"] = pd.to_numeric(df["pm_fault_bikes_in_cluster"], errors="coerce").fillna(0)
     return df.groupby(["date", "cluster"], as_index=False)[["deployed", "not_operational"]].sum()
