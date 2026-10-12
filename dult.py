@@ -29,6 +29,9 @@ CITY = "BLR"
 BIKE_CATEGORY = "Miracle"
 BLR_TOTAL = "BLR (Total)"
 OUTSIDE = "Outside cluster"
+# Only these clusters get their own rows and count towards BLR (Total); every other cluster is folded into OUTSIDE.
+KEEP_CLUSTERS = ["CBD", "Electronic City", "Hebbal", "Indiranagar", "ORR", "Whitefield"]
+CACHE_TAG = "v2"  # bump when KEEP_CLUSTERS or the folding rules change: old cache files are then ignored
 
 START_CLUSTER_COL = "Start Operation Cluster Parent Geozone Name"
 END_CLUSTER_COL = "End Operation Cluster Parent Geozone Name"
@@ -50,12 +53,13 @@ PEAK_SUMMARY_OUT = ["cluster", "day_type", "peak_hour", "second_hour", "third_ho
 PEAK_OUT = ["cluster", "day_type", "hour", "avg_trips_per_day", "share_of_day_pct"]
 
 DEFINITIONS = [
+    f"Clusters: {', '.join(KEEP_CLUSTERS)} are reported individually and make up BLR (Total). Every other cluster, and trips with no cluster, are folded into Outside cluster, which is not part of BLR (Total).",
     "Trip = shared journey of a Miracle bike in BLR, any ride status. Long-term-rental rows are excluded (0 km, not trips).",
     "A trip counts on the day it starts and in the cluster it starts in. Trips ended = same trips grouped by the cluster they end in.",
     "Active users = distinct riders. BLR (Total) is distinct across all of BLR, so it is not the sum of the clusters.",
     "Avg km / ride minutes per user = total km / minutes divided by active users. Monthly = total divided by the sum of daily active users.",
     "Avg trip duration = total ride minutes / trips (start to end, pauses included).",
-    "Deployed bikes = sum of pm_bor. Not operational = sum of pm_fault_bikes_in_cluster. Operational = deployed minus not operational. BLR (Total) = sum of clusters.",
+    "Deployed bikes = sum of pm_bor. Not operational = sum of pm_fault_bikes_in_cluster. Operational = deployed minus not operational. BLR (Total) = sum of the six kept clusters.",
     "Peak hours = trips by start hour, averaged per day over the window (days with no trips count as zero).",
 ]
 
@@ -166,9 +170,11 @@ def fetch_csv(card_id, values, timeout=900):
     return _with_retries(call, f"card {card_id} {values.get('start_date')}..{values.get('end_date')}")
 
 
-def _clean_cluster(series):
-    s = series.fillna("").astype(str).str.strip()
-    return s.where(s != "", OUTSIDE)
+def _fold_cluster(series):
+    keep = {" ".join(c.lower().split()): c for c in KEEP_CLUSTERS}
+    key = series.fillna("").astype(str).str.lower().str.split().str.join(" ")
+    key = key.str.removesuffix(" cluster")
+    return key.map(keep).fillna(OUTSIDE)
 
 
 def aggregate_journeys(text):
@@ -199,10 +205,10 @@ def aggregate_journeys(text):
     df["km"] = pd.to_numeric(df["Journey Distance"], errors="coerce").fillna(0.0)
     df["minutes"] = pd.to_numeric(df["Total Journey Time"], errors="coerce").fillna(0.0) / 60.0
     df["hour"] = pd.to_numeric(df["Start Time"].fillna("").str[:2], errors="coerce")
-    df["start_cluster"] = _clean_cluster(df[START_CLUSTER_COL])
+    df["start_cluster"] = _fold_cluster(df[START_CLUSTER_COL])
     has_end = df["End Time"].fillna("").str.strip() != "" if "End Time" in df.columns else pd.Series(True, index=df.index)
     end_col = df[END_CLUSTER_COL] if END_CLUSTER_COL in df.columns else pd.Series("", index=df.index)
-    df["end_cluster"] = _clean_cluster(end_col)
+    df["end_cluster"] = _fold_cluster(end_col)
     df["ended"] = has_end
 
     started = (df.groupby(["date", "start_cluster"])
@@ -213,11 +219,12 @@ def aggregate_journeys(text):
              .reset_index().rename(columns={"end_cluster": "cluster"}))
     daily = started.merge(ended, on=["date", "cluster"], how="outer").fillna(0)
 
-    total = (df.groupby("date")
+    df_in = df[df["start_cluster"] != OUTSIDE]  # BLR (Total) = kept clusters only
+    total = (df_in.groupby("date")
              .agg(trips_started=("Journey_Id", "size"), total_km=("km", "sum"),
                   total_minutes=("minutes", "sum"), active_users=("User Id", "nunique"))
              .reset_index())
-    total["trips_ended"] = total["date"].map(df[df["ended"]].groupby("date").size()).fillna(0)
+    total["trips_ended"] = total["date"].map(df_in[df_in["ended"]].groupby("date").size()).fillna(0)
     total["cluster"] = BLR_TOTAL
     daily = pd.concat([daily[DAILY_COLS], total[DAILY_COLS]], ignore_index=True)
 
@@ -225,7 +232,7 @@ def aggregate_journeys(text):
     timed["hour"] = timed["hour"].astype(int)
     hourly = (timed.groupby(["date", "start_cluster", "hour"]).size().rename("trips")
               .reset_index().rename(columns={"start_cluster": "cluster"}))
-    hourly_total = timed.groupby(["date", "hour"]).size().rename("trips").reset_index()
+    hourly_total = timed[timed["start_cluster"] != OUTSIDE].groupby(["date", "hour"]).size().rename("trips").reset_index()
     hourly_total["cluster"] = BLR_TOTAL
     hourly = pd.concat([hourly[HOURLY_COLS], hourly_total[HOURLY_COLS]], ignore_index=True)
     return daily, hourly
@@ -243,14 +250,14 @@ def parse_bikes(text):
     df = df[df["city"].fillna("").str.strip().str.upper() == CITY]
     df = df[df["cluster_name"].fillna("").str.strip() != ""].copy()
     df["date"] = df["date"].str[:10]
-    df["cluster"] = df["cluster_name"].str.strip()
+    df["cluster"] = _fold_cluster(df["cluster_name"])
     df["deployed"] = pd.to_numeric(df["pm_bor"], errors="coerce").fillna(0)
     df["not_operational"] = pd.to_numeric(df["pm_fault_bikes_in_cluster"], errors="coerce").fillna(0)
     return df.groupby(["date", "cluster"], as_index=False)[["deployed", "not_operational"]].sum()
 
 
 def _cache_path(source, name, first):
-    return os.path.join(CACHE_DIR, f"{source}_{name}_{first:%Y-%m}.csv.gz")
+    return os.path.join(CACHE_DIR, f"{source}_{name}_{CACHE_TAG}_{first:%Y-%m}.csv.gz")
 
 
 def _read_cache(source, name, first):
@@ -362,7 +369,7 @@ def build_tables(daily_j, hourly_j, bikes, win_start, yesterday):
             .reindex(index).fillna(0))
 
     bk = bikes[bikes["date"].isin(dates)]
-    bk_total = bk.groupby("date", as_index=False)[["deployed", "not_operational"]].sum()
+    bk_total = bk[bk["cluster"] != OUTSIDE].groupby("date", as_index=False)[["deployed", "not_operational"]].sum()
     bk_total["cluster"] = BLR_TOTAL
     bk = pd.concat([bk[BIKE_COLS], bk_total[BIKE_COLS]], ignore_index=True)
     b = bk.groupby(["date", "cluster"])[["deployed", "not_operational"]].sum().reindex(index)
