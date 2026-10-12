@@ -1,0 +1,60 @@
+name: DULT KPI Refresh
+
+on:
+  # On-demand refresh without GitHub UI/API access: commit a change to
+  # .github/dult-refresh-now.txt and push to main.
+  push:
+    branches: [main]
+    paths:
+      - ".github/dult-refresh-now.txt"
+  schedule:
+    # GitHub starts scheduled runs hours late, so the main slot is early and
+    # holds itself until 09:30 IST if it starts before then (same trick as the
+    # Yulu ETL). 04:23 IST = 22:53 UTC (previous day).
+    - cron: "53 22 * * *"
+    # Fallback pass at 11:00 IST. Every run rewrites the whole 365-day window,
+    # so repeated or late runs are harmless.
+    - cron: "30 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: dult
+  cancel-in-progress: false
+
+jobs:
+  dult:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Closed months are cached as small per-day aggregates (no rider data).
+      - name: Restore DULT month cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/dult_months
+          key: dult-months-cache-${{ github.run_id }}
+          restore-keys: |
+            dult-months-cache-
+
+      - name: Hold until target IST time
+        if: github.event_name == 'schedule' && github.event.schedule == '53 22 * * *'
+        run: bash .github/scripts/hold_until_ist.sh 04:20 09:30
+
+      - name: Run DULT
+        env:
+          METABASE_URL: ${{ secrets.METABASE_URL }}
+          METABASE_EMAIL: ${{ secrets.METABASE_EMAIL }}
+          METABASE_PASSWORD: ${{ secrets.METABASE_PASSWORD }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: python dult.py
