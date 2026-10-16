@@ -477,7 +477,15 @@ function sectionUtilization() {
     .map(c => ({ name: c, v: getUtilForDate(c, "util_pct", snapshotDate) }))
     .filter(r => r.v !== null);
 
-  const tableRows = totalName ? [totalName, ...names] : names;
+  // Full snapshot: city total pinned on top, clusters by Util % descending (no value last).
+  const byUtil = names.slice().sort((x, y) => {
+    const a = getUtilForDate(x, "util_pct", snapshotDate), b = getUtilForDate(y, "util_pct", snapshotDate);
+    if (a === null && b === null) return 0;
+    if (a === null) return 1;
+    if (b === null) return -1;
+    return b - a;
+  });
+  const tableRows = totalName ? [totalName, ...byUtil] : byUtil;
   const utilTableBody = tableRows.map(c => {
     const cells = UTIL_TABLE_COLS.map(col => {
       const v = getUtilForDate(c, col.key, snapshotDate);
@@ -497,7 +505,7 @@ function sectionUtilization() {
         ${barChart(rankRows, r => r.v, { fmt: v => v.toFixed(1) + "%", max: 100 })}
       </div>
       <div class="panel" style="overflow-x:auto;">
-        <h3>Full Snapshot — Every Column (${fmtDate(snapshotDate)})</h3>
+        <h3>Full Snapshot — Every Column, sorted by Util % (${fmtDate(snapshotDate)})</h3>
         <table class="ptable">
           <thead><tr><th>Cluster</th>${UTIL_TABLE_COLS.map(col => `<th>${col.label}</th>`).join("")}</tr></thead>
           <tbody>${utilTableBody}</tbody>
